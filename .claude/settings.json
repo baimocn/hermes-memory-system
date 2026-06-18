@@ -262,6 +262,18 @@
           }
         ],
         "matcher": ""
+      },
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "python C:/Users/35955/.claude/hooks/hermes-recall-hook.py",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
       }
     ]
   },

@@ -1289,6 +1289,102 @@ class MemoryVectorStore:
             pass
 
     # ------------------------------------------------------------------
+    # 自省方法 (Phase 8: Self-Reflection & Introspection)
+    # ------------------------------------------------------------------
+
+    def introspect_gc(self, max_age_days: int = 30, min_confidence: float = 0.2) -> list:
+        """Mark low-confidence old memories as archived. Returns list of archived keys."""
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+            cutoff = now - max_age_days * 86400
+
+            rows = conn.execute(
+                """SELECT key FROM memory_vectors
+                   WHERE confidence < ? AND updated_at < ? AND importance != 'archived'""",
+                (min_confidence, cutoff),
+            ).fetchall()
+
+            archived_keys = [r[0] for r in rows]
+            if archived_keys:
+                conn.execute(
+                    "UPDATE memory_vectors SET importance = 'archived' WHERE confidence < ? AND updated_at < ?",
+                    (min_confidence, cutoff),
+                )
+                conn.commit()
+
+            return archived_keys
+        except Exception as e:
+            print(f"[vmem] introspect_gc error: {e}")
+            return []
+
+    def introspect_contradictions(self, limit: int = 20) -> list:
+        """Get recent contradiction links."""
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                """SELECT ml.from_id, ml.to_id, ml.strength,
+                          mv1.value, mv2.value
+                   FROM memory_links ml
+                   LEFT JOIN memory_vectors mv1 ON mv1.key = ml.from_id
+                   LEFT JOIN memory_vectors mv2 ON mv2.key = ml.to_id
+                   WHERE ml.link_type = 'contradicts'
+                   ORDER BY ml.created_at DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [
+                {
+                    "from_key": r[0],
+                    "to_key": r[1],
+                    "strength": r[2],
+                    "from_value": r[3] or "",
+                    "to_value": r[4] or "",
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[vmem] introspect_contradictions error: {e}")
+            return []
+
+    def introspect_health(self) -> dict:
+        """Return system health report."""
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+            cutoff_30d = now - 30 * 86400
+
+            total = conn.execute("SELECT COUNT(*) FROM memory_vectors").fetchone()[0]
+            topics = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
+            avg_conf = conn.execute("SELECT AVG(confidence) FROM memory_vectors").fetchone()[0] or 0.0
+            gc_candidates = conn.execute(
+                "SELECT COUNT(*) FROM memory_vectors WHERE confidence < 0.2 AND updated_at < ?",
+                (cutoff_30d,),
+            ).fetchone()[0]
+            contradictions = conn.execute(
+                "SELECT COUNT(*) FROM memory_links WHERE link_type = 'contradicts'"
+            ).fetchone()[0]
+            causal_chains = conn.execute("SELECT COUNT(*) FROM causal_links").fetchone()[0]
+            profile_attrs = conn.execute("SELECT COUNT(*) FROM profile_attributes").fetchone()[0]
+            archived = conn.execute(
+                "SELECT COUNT(*) FROM memory_vectors WHERE importance = 'archived'"
+            ).fetchone()[0]
+
+            return {
+                "total_memories": total,
+                "total_topics": topics,
+                "avg_confidence": round(avg_conf, 3),
+                "gc_candidates": gc_candidates,
+                "contradictions": contradictions,
+                "causal_chains": causal_chains,
+                "profile_attributes": profile_attrs,
+                "archived": archived,
+            }
+        except Exception as e:
+            print(f"[vmem] introspect_health error: {e}")
+            return {"error": str(e)}
+
+    # ------------------------------------------------------------------
     # 上下文管理器
     # ------------------------------------------------------------------
 

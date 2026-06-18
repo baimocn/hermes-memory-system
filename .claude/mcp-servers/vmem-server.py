@@ -363,5 +363,16 @@ def vmem_topics() -> str:
     return json.dumps(topics, ensure_ascii=False, indent=2)
 
 
+@mcp.tool()
+def vmem_introspect() -> str:
+    """返回记忆系统健康报告。
+
+    包含总记忆数、话题数、平均置信度、GC 候选、矛盾数等指标。
+    """
+    store = get_store()
+    health = store.introspect_health()
+    return json.dumps(health, ensure_ascii=False, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()

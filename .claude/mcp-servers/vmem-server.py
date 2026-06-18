@@ -258,5 +258,54 @@ def vmem_profile_set(
     return json.dumps({"ok": ok, "key": key, "category": category})
 
 
+@mcp.tool()
+def vmem_causal_chain(key: str, max_depth: int = 5) -> str:
+    """查询记忆的因果链。
+
+    返回指定记忆的所有祖先节点（因果链上游），按深度排序。
+
+    Args:
+        key: 记忆键名
+        max_depth: 最大查询深度（默认5）
+    """
+    store = get_store()
+    results = store.causal_chain(key, max_depth)
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def vmem_causal_add(
+    from_key: str,
+    to_key: str,
+    relation: str,
+    strength: float = 1.0,
+) -> str:
+    """添加因果关系链接。
+
+    Args:
+        from_key: 原因/来源记忆键
+        to_key: 结果/目标记忆键
+        relation: 关系类型 (caused_by/led_to/resolved/contradicts/supersedes)
+        strength: 关系强度 (0.0-1.0)
+    """
+    store = get_store()
+    ok = store.causal_add(from_key, to_key, relation, strength)
+    return json.dumps({"ok": ok, "from": from_key, "to": to_key, "relation": relation})
+
+
+@mcp.tool()
+def vmem_causal_get(key: str) -> str:
+    """获取记忆的直接因果链接。
+
+    返回所有 from_id 或 to_id 为指定 key 的因果链接。
+
+    Args:
+        key: 记忆键名
+    """
+    store = get_store()
+    results = store.causal_get(key)
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()

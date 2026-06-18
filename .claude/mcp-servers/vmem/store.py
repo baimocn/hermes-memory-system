@@ -616,6 +616,182 @@ class MemoryVectorStore:
         return "\n".join(lines) if lines else "(no profile data)"
 
     # ------------------------------------------------------------------
+    # 因果链方法 (Phase 3: Causal Chain Memory)
+    # ------------------------------------------------------------------
+
+    VALID_RELATIONS = {"caused_by", "led_to", "resolved", "contradicts", "supersedes"}
+
+    def causal_add(
+        self,
+        from_key: str,
+        to_key: str,
+        relation: str,
+        strength: float = 1.0,
+    ) -> bool:
+        """Add a causal link and maintain closure_table."""
+        if relation not in self.VALID_RELATIONS:
+            print(f"[vmem] causal_add: invalid relation '{relation}'")
+            return False
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+
+            conn.execute(
+                "INSERT INTO causal_links (from_id, to_id, relation, strength, created_at) VALUES (?, ?, ?, ?, ?)",
+                (from_key, to_key, relation, strength, now),
+            )
+
+            # Maintain closure_table
+            conn.execute(
+                "INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth) VALUES (?, ?, 0)",
+                (from_key, from_key),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth) VALUES (?, ?, 0)",
+                (to_key, to_key),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth) VALUES (?, ?, 1)",
+                (from_key, to_key),
+            )
+            # Transitive: ancestors of from_key → to_key
+            conn.execute(
+                """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+                   SELECT ct.ancestor, ?, ct.depth + 1
+                   FROM closure_table ct
+                   WHERE ct.descendant = ? AND ct.depth > 0""",
+                (to_key, from_key),
+            )
+            # Transitive: from_key → descendants of to_key
+            conn.execute(
+                """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+                   SELECT ?, ct.descendant, ct.depth + 1
+                   FROM closure_table ct
+                   WHERE ct.ancestor = ? AND ct.depth > 0""",
+                (from_key, to_key),
+            )
+            # Cross: ancestors of from_key → descendants of to_key
+            conn.execute(
+                """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+                   SELECT a.ancestor, d.descendant, a.depth + d.depth + 1
+                   FROM closure_table a, closure_table d
+                   WHERE a.descendant = ? AND a.depth > 0
+                     AND d.ancestor = ? AND d.depth > 0""",
+                (from_key, to_key),
+            )
+
+            conn.commit()
+            return True
+
+        except Exception as e:
+            print(f"[vmem] causal_add error: {e}")
+            return False
+
+    def causal_chain(self, key: str, max_depth: int = 5) -> list:
+        """Get causal chain ancestors for a key. Returns list of dicts."""
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                """SELECT ct.ancestor, ct.depth, mv.value, mv.source,
+                          cl.relation, cl.strength
+                   FROM closure_table ct
+                   LEFT JOIN causal_links cl
+                     ON (cl.from_id = ct.ancestor AND cl.to_id = ?)
+                     OR (cl.to_id = ct.ancestor AND cl.from_id = ?)
+                   LEFT JOIN memory_vectors mv ON mv.key = ct.ancestor
+                   WHERE ct.descendant = ? AND ct.depth > 0 AND ct.depth <= ?
+                   ORDER BY ct.depth""",
+                (key, key, key, max_depth),
+            ).fetchall()
+
+            return [
+                {
+                    "key": r[0],
+                    "depth": r[1],
+                    "value": r[2] or "",
+                    "source": r[3] or "",
+                    "relation": r[4] or "",
+                    "strength": r[5] or 0.0,
+                }
+                for r in rows
+            ]
+
+        except Exception as e:
+            print(f"[vmem] causal_chain error: {e}")
+            return []
+
+    def causal_get(self, key: str) -> list:
+        """Get all direct causal links where key is from_id or to_id."""
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT id, from_id, to_id, relation, strength, created_at FROM causal_links WHERE from_id = ? OR to_id = ?",
+                (key, key),
+            ).fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "from_id": r[1],
+                    "to_id": r[2],
+                    "relation": r[3],
+                    "strength": r[4],
+                    "created_at": r[5],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[vmem] causal_get error: {e}")
+            return []
+
+    def causal_delete(self, link_id: int) -> bool:
+        """Delete a causal link and rebuild closure_table."""
+        try:
+            conn = self._get_conn()
+
+            link = conn.execute(
+                "SELECT from_id, to_id FROM causal_links WHERE id = ?", (link_id,)
+            ).fetchone()
+            if not link:
+                return False
+
+            conn.execute("DELETE FROM causal_links WHERE id = ?", (link_id,))
+
+            # Rebuild closure_table from remaining links
+            conn.execute("DELETE FROM closure_table WHERE depth > 0")
+            conn.execute(
+                """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+                   SELECT from_id, from_id, 0 FROM causal_links
+                   UNION
+                   SELECT to_id, to_id, 0 FROM causal_links"""
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+                   SELECT from_id, to_id, 1 FROM causal_links"""
+            )
+            # Iterative transitive closure
+            for _ in range(10):
+                result = conn.execute(
+                    """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+                       SELECT a.ancestor, d.descendant, a.depth + d.depth
+                       FROM closure_table a
+                       JOIN closure_table d ON a.descendant = d.ancestor AND d.depth > 0
+                       WHERE a.depth > 0
+                         AND NOT EXISTS (
+                           SELECT 1 FROM closure_table e
+                           WHERE e.ancestor = a.ancestor AND e.descendant = d.descendant
+                         )"""
+                )
+                if result.rowcount == 0:
+                    break
+
+            conn.commit()
+            return True
+
+        except Exception as e:
+            print(f"[vmem] causal_delete error: {e}")
+            return False
+
+    # ------------------------------------------------------------------
     # 上下文管理器
     # ------------------------------------------------------------------
 

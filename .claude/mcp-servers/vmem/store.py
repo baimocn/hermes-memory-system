@@ -67,6 +67,7 @@ class MemoryVectorStore:
 
         self._engine = embedding_engine or EmbeddingEngine()
         self._conn: Optional[sqlite3.Connection] = None
+        self._topic_counter = 0  # tracks new memories since last topic recalc
 
         self._init_db()
 
@@ -179,6 +180,13 @@ class MemoryVectorStore:
             # Initialize decay state (Phase 6)
             self.decay_init(key, source)
 
+            # Auto-cluster into topics (Phase 7)
+            if embedding is not None:
+                try:
+                    self._auto_cluster(key, value, embedding)
+                except Exception:
+                    pass
+
             return True
 
         except Exception as e:
@@ -278,6 +286,7 @@ class MemoryVectorStore:
         w_fts: float = 0.20,
         w_time: float = 0.10,
         w_conf: float = 0.20,
+        topic_filter: int = None,
     ) -> List[Dict[str, Any]]:
         """
         融合搜索：w_vec*向量 + w_fts*全文 + w_time*时间衰减 + w_conf*置信度。
@@ -295,6 +304,19 @@ class MemoryVectorStore:
 
             if not rows:
                 return []
+
+            # Topic filter (Phase 7)
+            if topic_filter is not None:
+                topic_keys = {
+                    r[0] for r in conn.execute(
+                        "SELECT DISTINCT session_id FROM session_topics WHERE topic_id = ?",
+                        (topic_filter,),
+                    ).fetchall()
+                }
+                if topic_keys:
+                    rows = [r for r in rows if r[0] in topic_keys]
+                else:
+                    return []
 
             query_emb = np.asarray(query_emb, dtype=np.float32).flatten()
             now = int(time.time())
@@ -1105,6 +1127,166 @@ class MemoryVectorStore:
             return max(r, 0.01)
         except Exception:
             return 1.0
+
+    # ------------------------------------------------------------------
+    # 话题聚类方法 (Phase 7: Cross-Session Topic Clustering)
+    # ------------------------------------------------------------------
+
+    TOPIC_MATCH_THRESHOLD = 0.75
+    TOPIC_RECALC_INTERVAL = 50
+
+    def topic_create(self, name: str, centroid: np.ndarray = None) -> int:
+        """Create a new topic. Returns topic id."""
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+            centroid_blob = centroid.astype(np.float32).tobytes() if centroid is not None else None
+            cur = conn.execute(
+                "INSERT INTO topics (name, centroid, session_count, created_at) VALUES (?, ?, 0, ?)",
+                (name, centroid_blob, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+        except Exception as e:
+            print(f"[vmem] topic_create error: {e}")
+            return -1
+
+    def topic_match(self, embedding: np.ndarray) -> tuple:
+        """Find best matching topic for an embedding. Returns (topic_id, similarity) or (None, 0)."""
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT id, centroid FROM topics WHERE centroid IS NOT NULL"
+            ).fetchall()
+
+            if not rows:
+                return (None, 0.0)
+
+            query_emb = np.asarray(embedding, dtype=np.float32).flatten()
+            best_id = None
+            best_sim = 0.0
+
+            for topic_id, centroid_blob in rows:
+                try:
+                    centroid = np.frombuffer(centroid_blob, dtype=np.float32)
+                    if centroid.shape[0] != self.EMBED_DIM:
+                        continue
+                    sim = float(np.dot(query_emb, centroid))
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_id = topic_id
+                except Exception:
+                    continue
+
+            if best_sim >= self.TOPIC_MATCH_THRESHOLD:
+                return (best_id, best_sim)
+            return (None, best_sim)
+
+        except Exception as e:
+            print(f"[vmem] topic_match error: {e}")
+            return (None, 0.0)
+
+    def topic_add_memory(self, topic_id: int, key: str, session_id: str = "") -> bool:
+        """Link a memory to a topic."""
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO session_topics (session_id, topic_id, similarity, created_at) VALUES (?, ?, 1.0, ?)",
+                (key, topic_id, now),  # Use key as session_id for memory linking
+            )
+            conn.execute(
+                "UPDATE topics SET session_count = session_count + 1 WHERE id = ?",
+                (topic_id,),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[vmem] topic_add_memory error: {e}")
+            return False
+
+    def topic_recalculate(self, topic_id: int) -> bool:
+        """Recalculate topic centroid from linked memory embeddings."""
+        try:
+            conn = self._get_conn()
+
+            # Get all memory keys linked to this topic
+            keys = conn.execute(
+                "SELECT DISTINCT session_id FROM session_topics WHERE topic_id = ?",
+                (topic_id,),
+            ).fetchall()
+
+            embeddings = []
+            for (key,) in keys:
+                emb_row = conn.execute(
+                    "SELECT embedding FROM memory_vectors WHERE key = ? AND embedding IS NOT NULL",
+                    (key,),
+                ).fetchone()
+                if emb_row and emb_row[0]:
+                    try:
+                        emb_data = emb_row[0]
+                        if not isinstance(emb_data, (bytes, bytearray, memoryview)):
+                            continue
+                        emb = np.frombuffer(bytes(emb_data), dtype=np.float32)
+                        if emb.shape[0] == self.EMBED_DIM:
+                            embeddings.append(emb.copy())
+                    except Exception:
+                        continue
+
+            if not embeddings:
+                return False
+
+            mean_emb = np.mean(embeddings, axis=0).astype(np.float32)
+            conn.execute(
+                "UPDATE topics SET centroid = ? WHERE id = ?",
+                (mean_emb.tobytes(), topic_id),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[vmem] topic_recalculate error: {e}")
+            return False
+
+    def topic_list(self) -> list:
+        """List all topics."""
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT id, name, session_count, created_at FROM topics ORDER BY session_count DESC"
+            ).fetchall()
+            return [
+                {"id": r[0], "name": r[1], "session_count": r[2], "created_at": r[3]}
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    def _auto_cluster(self, key: str, value: str, embedding: np.ndarray) -> None:
+        """Auto-cluster a memory into a topic."""
+        topic_id, sim = self.topic_match(embedding)
+        if topic_id is not None:
+            self.topic_add_memory(topic_id, key)
+        else:
+            name = value[:50].replace("\n", " ").strip()
+            if not name:
+                name = f"topic_{key}"
+            topic_id = self.topic_create(name, embedding)
+            if topic_id > 0:
+                self.topic_add_memory(topic_id, key)
+
+        self._topic_counter += 1
+        if self._topic_counter >= self.TOPIC_RECALC_INTERVAL:
+            self._recalculate_all_topics()
+            self._topic_counter = 0
+
+    def _recalculate_all_topics(self) -> None:
+        """Recalculate centroids for all topics."""
+        try:
+            topics = self.topic_list()
+            for t in topics:
+                self.topic_recalculate(t["id"])
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 上下文管理器

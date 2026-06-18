@@ -352,5 +352,16 @@ def vmem_link_add(
     return json.dumps({"ok": ok, "from": from_key, "to": to_key, "link_type": link_type})
 
 
+@mcp.tool()
+def vmem_topics() -> str:
+    """列出所有话题聚类。
+
+    返回所有话题及其关联记忆数量。
+    """
+    store = get_store()
+    topics = store.topic_list()
+    return json.dumps(topics, ensure_ascii=False, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()

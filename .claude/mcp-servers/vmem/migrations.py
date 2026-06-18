@@ -265,20 +265,27 @@ def _migrate_009(conn: sqlite3.Connection) -> None:
 
 def _migrate_010_cleanup_memory_vectors(conn: sqlite3.Connection) -> None:
     """010 — Drop access_count (D-05), rename level->importance (D-06), convert tags to JSON (D-07)."""
-    # D-05: Drop access_count column (SQLite 3.35+ supports DROP COLUMN)
-    conn.execute("ALTER TABLE memory_vectors DROP COLUMN access_count")
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(memory_vectors)").fetchall()}
 
-    # D-06: Rename level -> importance
-    conn.execute("ALTER TABLE memory_vectors RENAME COLUMN level TO importance")
+    # D-05: Drop access_count column (only if it exists)
+    if "access_count" in columns:
+        conn.execute("ALTER TABLE memory_vectors DROP COLUMN access_count")
+
+    # D-06: Rename level -> importance (only if level column exists)
+    if "level" in columns:
+        conn.execute("ALTER TABLE memory_vectors RENAME COLUMN level TO importance")
 
     # D-07: Convert tags from comma-separated to JSON array
     rows = conn.execute(
         "SELECT key, tags FROM memory_vectors WHERE tags != '' AND tags IS NOT NULL"
     ).fetchall()
     for key, tags_str in rows:
-        tag_list = [t.strip() for t in tags_str.split(",") if t.strip()]
-        tags_json = json.dumps(tag_list, ensure_ascii=False)
-        conn.execute("UPDATE memory_vectors SET tags = ? WHERE key = ?", (tags_json, key))
+        try:
+            tag_list = [t.strip() for t in tags_str.split(",") if t.strip()]
+            tags_json = json.dumps(tag_list, ensure_ascii=False)
+            conn.execute("UPDATE memory_vectors SET tags = ? WHERE key = ?", (tags_json, key))
+        except (json.JSONDecodeError, AttributeError):
+            pass  # already JSON or empty
 
 
 # ---------------------------------------------------------------------------

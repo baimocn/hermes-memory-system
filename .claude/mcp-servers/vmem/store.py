@@ -168,6 +168,10 @@ class MemoryVectorStore:
             )
 
             conn.commit()
+
+            # Auto-detect contradictions and create links (Phase 4)
+            self._auto_link_on_store(key, value, embedding)
+
             return True
 
         except Exception as e:
@@ -790,6 +794,128 @@ class MemoryVectorStore:
         except Exception as e:
             print(f"[vmem] causal_delete error: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # 记忆关系图方法 (Phase 4: Memory Relation Graph)
+    # ------------------------------------------------------------------
+
+    VALID_LINK_TYPES = {"related_to", "contradicts", "refines", "supersedes", "caused_by"}
+    CONTRADICTION_THRESHOLD = 0.85
+
+    def link_add(
+        self,
+        from_key: str,
+        to_key: str,
+        link_type: str,
+        strength: float = 1.0,
+    ) -> bool:
+        """Add a typed link between two memories."""
+        if link_type not in self.VALID_LINK_TYPES:
+            print(f"[vmem] link_add: invalid link_type '{link_type}'")
+            return False
+        try:
+            conn = self._get_conn()
+            # Avoid duplicates
+            existing = conn.execute(
+                "SELECT id FROM memory_links WHERE from_id = ? AND to_id = ? AND link_type = ?",
+                (from_key, to_key, link_type),
+            ).fetchone()
+            if existing:
+                return True  # already exists
+
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO memory_links (from_id, to_id, link_type, strength, created_at) VALUES (?, ?, ?, ?, ?)",
+                (from_key, to_key, link_type, strength, now),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[vmem] link_add error: {e}")
+            return False
+
+    def link_get(self, key: str, link_type: str = None) -> list:
+        """Get all links involving a key, optionally filtered by type."""
+        try:
+            conn = self._get_conn()
+            if link_type:
+                rows = conn.execute(
+                    "SELECT id, from_id, to_id, link_type, strength, created_at FROM memory_links WHERE (from_id = ? OR to_id = ?) AND link_type = ?",
+                    (key, key, link_type),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, from_id, to_id, link_type, strength, created_at FROM memory_links WHERE from_id = ? OR to_id = ?",
+                    (key, key),
+                ).fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "from_id": r[1],
+                    "to_id": r[2],
+                    "link_type": r[3],
+                    "strength": r[4],
+                    "created_at": r[5],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[vmem] link_get error: {e}")
+            return []
+
+    def link_delete(self, link_id: int) -> bool:
+        """Delete a memory link."""
+        try:
+            conn = self._get_conn()
+            conn.execute("DELETE FROM memory_links WHERE id = ?", (link_id,))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[vmem] link_delete error: {e}")
+            return False
+
+    def _detect_contradictions(self, key: str, embedding: np.ndarray) -> list:
+        """Find memories with high cosine similarity that may contradict."""
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT key, value, embedding FROM memory_vectors WHERE embedding IS NOT NULL AND key != ?",
+                (key,),
+            ).fetchall()
+
+            query_emb = np.asarray(embedding, dtype=np.float32).flatten()
+            contradictions = []
+            for row in rows:
+                try:
+                    emb_data = row[2]
+                    if emb_data is None:
+                        continue
+                    if not isinstance(emb_data, (bytes, bytearray, memoryview)):
+                        continue
+                    db_emb = np.frombuffer(bytes(emb_data), dtype=np.float32)
+                    if db_emb.shape[0] != self.EMBED_DIM:
+                        continue
+                    sim = float(np.dot(query_emb, db_emb))
+                    if sim >= self.CONTRADICTION_THRESHOLD:
+                        contradictions.append({"key": row[0], "value": row[1], "similarity": sim})
+                except Exception:
+                    continue
+
+            return contradictions
+        except Exception as e:
+            print(f"[vmem] _detect_contradictions error: {e}")
+            return []
+
+    def _auto_link_on_store(self, key: str, value: str, embedding: Optional[np.ndarray]) -> None:
+        """Auto-create supersedes and contradiction links after store()."""
+        try:
+            # Contradiction detection
+            if embedding is not None:
+                contradictions = self._detect_contradictions(key, embedding)
+                for c in contradictions:
+                    self.link_add(key, c["key"], "contradicts", c["similarity"])
+        except Exception:
+            pass  # link failures must not break store()
 
     # ------------------------------------------------------------------
     # 上下文管理器

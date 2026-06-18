@@ -307,5 +307,50 @@ def vmem_causal_get(key: str) -> str:
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 
+@mcp.tool()
+def vmem_related(key: str, link_type: str = "") -> str:
+    """查询记忆的关联记忆。
+
+    返回所有与指定记忆有关系的其他记忆。
+
+    Args:
+        key: 记忆键名
+        link_type: 关系类型过滤 (related_to/contradicts/refines/supersedes/caused_by)
+    """
+    store = get_store()
+    links = store.link_get(key, link_type if link_type else None)
+    # Enrich with the "other" key's value
+    enriched = []
+    for link in links:
+        other_key = link["to_id"] if link["from_id"] == key else link["from_id"]
+        other_mem = store.get(other_key)
+        enriched.append({
+            **link,
+            "other_key": other_key,
+            "other_value": other_mem["value"] if other_mem else "",
+        })
+    return json.dumps(enriched, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def vmem_link_add(
+    from_key: str,
+    to_key: str,
+    link_type: str,
+    strength: float = 1.0,
+) -> str:
+    """添加记忆之间的关系链接。
+
+    Args:
+        from_key: 来源记忆键
+        to_key: 目标记忆键
+        link_type: 关系类型 (related_to/contradicts/refines/supersedes/caused_by)
+        strength: 关系强度 (0.0-1.0)
+    """
+    store = get_store()
+    ok = store.link_add(from_key, to_key, link_type, strength)
+    return json.dumps({"ok": ok, "from": from_key, "to": to_key, "link_type": link_type})
+
+
 if __name__ == "__main__":
     mcp.run()

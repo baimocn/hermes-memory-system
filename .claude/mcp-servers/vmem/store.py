@@ -176,6 +176,9 @@ class MemoryVectorStore:
             # Set initial confidence based on source (Phase 5)
             self._set_initial_confidence(key, source, existing_confidence)
 
+            # Initialize decay state (Phase 6)
+            self.decay_init(key, source)
+
             return True
 
         except Exception as e:
@@ -321,12 +324,17 @@ class MemoryVectorStore:
             except Exception:
                 pass  # trigram 可能匹配失败，忽略
 
-            # --- 时间衰减得分 ---
+            # --- 时间衰减得分 (Phase 6: FSRS retrievability) ---
             time_scores: Dict[str, float] = {}
             for row in rows:
-                updated_at = row[8] or row[7]
-                elapsed = max(now - updated_at, 0)
-                time_scores[row[0]] = 2 ** (-(elapsed / half_life))
+                try:
+                    r = self.decay_retrievability(row[0])
+                    time_scores[row[0]] = r
+                except Exception:
+                    # Fallback to fixed half-life
+                    updated_at = row[8] or row[7]
+                    elapsed = max(now - updated_at, 0)
+                    time_scores[row[0]] = 2 ** (-(elapsed / half_life))
 
             # --- 置信度得分 (Phase 5) ---
             conf_scores: Dict[str, float] = {}
@@ -1000,6 +1008,103 @@ class MemoryVectorStore:
             conn.commit()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # FSRS 记忆衰减方法 (Phase 6: FSRS Memory Decay)
+    # ------------------------------------------------------------------
+
+    def _base_stability(self, source: str, importance: str = "") -> float:
+        """Return base stability (in days) based on memory type."""
+        combined = f"{source} {importance}".lower()
+        if "error" in combined or "lesson" in combined:
+            return 90.0
+        if "preference" in combined or "profile" in combined:
+            return 180.0
+        if "session" in combined:
+            return 7.0
+        return 30.0
+
+    def decay_init(self, key: str, source: str = "") -> bool:
+        """Initialize decay_state for a memory with type-based stability."""
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+
+            # Get memory info for stability calculation
+            row = conn.execute(
+                "SELECT source, importance FROM memory_vectors WHERE key = ?", (key,)
+            ).fetchone()
+            mem_source = row[0] if row else source
+            mem_importance = row[1] if row else ""
+
+            stability = self._base_stability(mem_source, mem_importance)
+
+            conn.execute(
+                """INSERT OR IGNORE INTO decay_state
+                   (memory_key, difficulty, stability, retrievability, last_review)
+                   VALUES (?, 0.0, ?, 1.0, ?)""",
+                (key, stability, now),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[vmem] decay_init error: {e}")
+            return False
+
+    def decay_recall(self, key: str) -> bool:
+        """Reinforce memory on successful recall: stability += 10%."""
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+
+            row = conn.execute(
+                "SELECT stability FROM decay_state WHERE memory_key = ?", (key,)
+            ).fetchone()
+
+            if not row:
+                self.decay_init(key)
+                row = conn.execute(
+                    "SELECT stability FROM decay_state WHERE memory_key = ?", (key,)
+                ).fetchone()
+
+            if not row:
+                return False
+
+            new_stability = row[0] * 1.10
+            conn.execute(
+                "UPDATE decay_state SET stability = ?, last_review = ? WHERE memory_key = ?",
+                (new_stability, now, key),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[vmem] decay_recall error: {e}")
+            return False
+
+    def decay_retrievability(self, key: str) -> float:
+        """Calculate FSRS retrievability: R(t) = (1 + t/(9*S))^(-1)."""
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+
+            row = conn.execute(
+                "SELECT stability, last_review FROM decay_state WHERE memory_key = ?", (key,)
+            ).fetchone()
+
+            if not row or not row[1]:
+                return 1.0
+
+            stability = row[0]
+            last_review = row[1]
+            t_days = max((now - last_review) / 86400.0, 0.0)
+
+            if stability <= 0:
+                return 0.01
+
+            r = (1 + t_days / (9 * stability)) ** (-1)
+            return max(r, 0.01)
+        except Exception:
+            return 1.0
 
     # ------------------------------------------------------------------
     # 上下文管理器

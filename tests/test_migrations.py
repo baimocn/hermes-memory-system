@@ -29,7 +29,7 @@ def test_tags_json_array(migrated_store):
 
 
 def test_schema_migrations_tracked(migrated_store):
-    """All 10 migrations recorded in schema_migrations."""
+    """All 11 migrations recorded in schema_migrations."""
     conn = migrated_store._get_conn()
     count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-    assert count == 10, f"Expected 10 migrations, got {count}"
+    assert count == 11, f"Expected 11 migrations, got {count}"

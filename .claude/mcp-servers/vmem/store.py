@@ -491,6 +491,131 @@ class MemoryVectorStore:
             return {"total": 0, "error": str(e)}
 
     # ------------------------------------------------------------------
+    # 用户画像方法 (Phase 2: User Profile System)
+    # ------------------------------------------------------------------
+
+    def _ensure_default_profile(self) -> int:
+        """Get or create the default user profile. Returns profile_id."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT id FROM user_profiles WHERE parent_id IS NULL LIMIT 1"
+        ).fetchone()
+        if row:
+            return row[0]
+        now = int(time.time())
+        cur = conn.execute(
+            "INSERT INTO user_profiles (parent_id, name, level, created_at) VALUES (NULL, 'default', 'root', ?)",
+            (now,),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    def profile_set(
+        self,
+        attr_key: str,
+        attr_value: str,
+        category: str,
+        confidence: float = 0.5,
+        source: str = "auto",
+    ) -> bool:
+        """Upsert a profile attribute. Merges confidence via max(existing, new)."""
+        try:
+            conn = self._get_conn()
+            profile_id = self._ensure_default_profile()
+            now = int(time.time())
+
+            existing = conn.execute(
+                "SELECT id, confidence FROM profile_attributes WHERE profile_id = ? AND attr_key = ?",
+                (profile_id, attr_key),
+            ).fetchone()
+
+            if existing:
+                new_conf = max(existing[1], confidence)
+                conn.execute(
+                    "UPDATE profile_attributes SET attr_value = ?, confidence = ?, source = ?, updated_at = ? WHERE id = ?",
+                    (attr_value, new_conf, source, now, existing[0]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO profile_attributes (profile_id, attr_key, attr_value, category, confidence, source, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (profile_id, attr_key, attr_value, category, confidence, source, now),
+                )
+
+            # Sync FTS5 index (content-sync table needs explicit rebuild for trigram)
+            conn.execute("INSERT INTO profile_attr_fts(profile_attr_fts) VALUES('rebuild')")
+            conn.commit()
+            return True
+
+        except Exception as e:
+            print(f"[vmem] profile_set error: {e}")
+            return False
+
+    def profile_get(self, attr_key: str = None, category: str = None) -> list:
+        """Query profile attributes. Returns list of dicts with keys:
+        attr_key, attr_value, category, confidence, source, updated_at"""
+        try:
+            conn = self._get_conn()
+            profile_id = self._ensure_default_profile()
+
+            if attr_key:
+                rows = conn.execute(
+                    "SELECT attr_key, attr_value, category, confidence, source, updated_at FROM profile_attributes WHERE profile_id = ? AND attr_key = ?",
+                    (profile_id, attr_key),
+                ).fetchall()
+            elif category:
+                rows = conn.execute(
+                    "SELECT attr_key, attr_value, category, confidence, source, updated_at FROM profile_attributes WHERE profile_id = ? AND category = ? ORDER BY confidence DESC",
+                    (profile_id, category),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT attr_key, attr_value, category, confidence, source, updated_at FROM profile_attributes WHERE profile_id = ? ORDER BY category, confidence DESC",
+                    (profile_id,),
+                ).fetchall()
+
+            return [
+                {
+                    "attr_key": r[0],
+                    "attr_value": r[1],
+                    "category": r[2],
+                    "confidence": r[3],
+                    "source": r[4],
+                    "updated_at": r[5],
+                }
+                for r in rows
+            ]
+
+        except Exception as e:
+            print(f"[vmem] profile_get error: {e}")
+            return []
+
+    def profile_summary(self) -> str:
+        """Generate markdown profile summary grouped by category.
+        Returns '(no profile data)' if empty."""
+        attrs = self.profile_get()
+        if not attrs:
+            return "(no profile data)"
+
+        category_order = ["identity", "skills", "preferences", "tools", "efficiency", "projects"]
+        grouped = {}
+        for a in attrs:
+            grouped.setdefault(a["category"], []).append(a)
+
+        lines = []
+        for cat in category_order:
+            items = grouped.get(cat)
+            if not items:
+                continue
+            lines.append(f"### {cat}")
+            for item in items:
+                line = f"- {item['attr_key']}: {item['attr_value']}"
+                if item["confidence"] < 0.8:
+                    line += f" ({item['confidence']:.0%})"
+                lines.append(line)
+
+        return "\n".join(lines) if lines else "(no profile data)"
+
+    # ------------------------------------------------------------------
     # 上下文管理器
     # ------------------------------------------------------------------
 

@@ -282,6 +282,18 @@ def _migrate_010_cleanup_memory_vectors(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Migration 011 — unique index on profile_attributes (PROF-01)
+# ---------------------------------------------------------------------------
+
+def _migrate_011_add_profile_unique_index(conn: sqlite3.Connection) -> None:
+    """011 — Unique index on profile_attributes(profile_id, attr_key) for upsert."""
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_attr_unique
+        ON profile_attributes(profile_id, attr_key)
+    """)
+
+
+# ---------------------------------------------------------------------------
 # MIGRATIONS registry
 # ---------------------------------------------------------------------------
 
@@ -296,6 +308,7 @@ MIGRATIONS = [
     ("008_session_topics", _migrate_008),
     ("009_decay_state", _migrate_009),
     ("010_cleanup_memory_vectors", _migrate_010_cleanup_memory_vectors),
+    ("011_profile_unique_index", _migrate_011_add_profile_unique_index),
 ]
 
 

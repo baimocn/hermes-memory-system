@@ -1,0 +1,290 @@
+{
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "effortLevel": "max",
+  "enabledPlugins": {
+    "claude-mem@thedotmack": true
+  },
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "mimo-v2.5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-8[1M]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "mimo-v2.5-pro",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6[1M]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "mimo-v2.5-pro",
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "ENABLE_TOOL_SEARCH": "true"
+  },
+  "hooks": {
+    "Elicitation": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" Elicitation",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" Notification",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "timeout": 600,
+            "type": "http",
+            "url": "http://127.0.0.1:23333/permission"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" PostCompact",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" PostToolUse",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" PostToolUseFailure",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" PreCompact",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" PreToolUse",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" SessionEnd",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/auto-start.js\"",
+            "shell": "powershell",
+            "timeout": 15,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      },
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" SessionStart",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      },
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "python C:/Users/35955/.claude/hooks/hermes-profile-session-hook.py",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" Stop",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" StopFailure",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" SubagentStart",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" SubagentStop",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "& \"C:\\Program Files\\nodejs\\node.exe\" \"D:/claude-desk/Clawd on Desk/resources/app.asar.unpacked/hooks/clawd-hook.js\" UserPromptSubmit",
+            "shell": "powershell",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Edit(*)",
+      "Write(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "Agent(*)",
+      "WebFetch(*)",
+      "WebSearch(*)",
+      "mcp__*"
+    ],
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(git push --force *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean -fd *)",
+      "Bash(git branch -D *)",
+      "Bash(git checkout -- *)",
+      "Bash(format *)",
+      "Bash(fdisk *)",
+      "Bash(mkfs *)",
+      "Bash(dd if=*)"
+    ]
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "statusLine": {
+    "command": "bash C:/Users/35955/.claude/statusline-command.sh",
+    "type": "command"
+  },
+  "theme": "auto"
+}

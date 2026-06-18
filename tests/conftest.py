@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import os
 import sys
+import sqlite3
 
 # Add vmem to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '.claude', 'mcp-servers'))
@@ -12,6 +13,10 @@ def tmp_vmem_db(tmp_path):
     """Copy real vmem.db to temp directory for safe migration testing."""
     real_db = r"C:\Users\35955\.claude\memory\vmem.db"
     tmp_db = str(tmp_path / "vmem.db")
+    # Checkpoint WAL to flush all pages into main DB file before copying
+    conn = sqlite3.connect(real_db)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
     shutil.copy2(real_db, tmp_db)
     return tmp_db
 

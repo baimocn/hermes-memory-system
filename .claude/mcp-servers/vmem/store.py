@@ -144,12 +144,13 @@ class MemoryVectorStore:
                 tags_json = "[]"
 
             conn = self._get_conn()
-            # 查旧记录的 created_at（D-05: access_count 已移除）
+            # 查旧记录的 created_at 和 confidence（Phase 5: 保留已有置信度）
             row = conn.execute(
-                "SELECT created_at FROM memory_vectors WHERE key = ?",
+                "SELECT created_at, confidence FROM memory_vectors WHERE key = ?",
                 (key,),
             ).fetchone()
             created_at = row[0] if row else now
+            existing_confidence = row[1] if row else None
 
             conn.execute(
                 """
@@ -171,6 +172,9 @@ class MemoryVectorStore:
 
             # Auto-detect contradictions and create links (Phase 4)
             self._auto_link_on_store(key, value, embedding)
+
+            # Set initial confidence based on source (Phase 5)
+            self._set_initial_confidence(key, source, existing_confidence)
 
             return True
 
@@ -267,12 +271,13 @@ class MemoryVectorStore:
         query: str,
         query_emb: np.ndarray,
         top_k: int = 10,
-        w_vec: float = 0.60,
-        w_fts: float = 0.25,
-        w_time: float = 0.15,
+        w_vec: float = 0.50,
+        w_fts: float = 0.20,
+        w_time: float = 0.10,
+        w_conf: float = 0.20,
     ) -> List[Dict[str, Any]]:
         """
-        融合搜索：w_vec*向量 + w_fts*全文 + w_time*时间衰减。
+        融合搜索：w_vec*向量 + w_fts*全文 + w_time*时间衰减 + w_conf*置信度。
         各分数归一化到 [0, 1] 后加权求和。
         """
         try:
@@ -280,7 +285,7 @@ class MemoryVectorStore:
             rows = conn.execute(
                 """
                 SELECT key, value, source, importance, tags, related, embedding,
-                       created_at, updated_at
+                       created_at, updated_at, COALESCE(confidence, 0.5)
                 FROM memory_vectors WHERE embedding IS NOT NULL
                 """
             ).fetchall()
@@ -323,6 +328,11 @@ class MemoryVectorStore:
                 elapsed = max(now - updated_at, 0)
                 time_scores[row[0]] = 2 ** (-(elapsed / half_life))
 
+            # --- 置信度得分 (Phase 5) ---
+            conf_scores: Dict[str, float] = {}
+            for row in rows:
+                conf_scores[row[0]] = row[9]  # COALESCE(confidence, 0.5)
+
             # --- 归一化函数 ---
             def _normalize(d: Dict[str, float]) -> Dict[str, float]:
                 if not d:
@@ -336,10 +346,11 @@ class MemoryVectorStore:
             vec_norm = _normalize(vec_scores)
             fts_norm = _normalize(fts_raw)
             time_norm = _normalize(time_scores)
+            conf_norm = _normalize(conf_scores)
 
             # --- 融合 ---
             all_keys = set()
-            for d in (vec_norm, fts_norm, time_norm):
+            for d in (vec_norm, fts_norm, time_norm, conf_norm):
                 all_keys.update(d.keys())
 
             fused = []
@@ -348,6 +359,7 @@ class MemoryVectorStore:
                     w_vec * vec_norm.get(key, 0.0)
                     + w_fts * fts_norm.get(key, 0.0)
                     + w_time * time_norm.get(key, 0.0)
+                    + w_conf * conf_norm.get(key, 0.0)
                 )
                 fused.append((key, s))
 
@@ -916,6 +928,78 @@ class MemoryVectorStore:
                     self.link_add(key, c["key"], "contradicts", c["similarity"])
         except Exception:
             pass  # link failures must not break store()
+
+    # ------------------------------------------------------------------
+    # 置信度评分方法 (Phase 5: Confidence Scoring)
+    # ------------------------------------------------------------------
+
+    SOURCE_CONFIDENCE = {
+        "user": 0.6, "user-explicit": 0.6,
+        "lesson": 0.7, "auto-lesson": 0.7,
+        "auto": 0.4, "auto-preference": 0.4,
+    }
+
+    def _initial_confidence(self, source: str) -> float:
+        """Return initial confidence based on memory source."""
+        return self.SOURCE_CONFIDENCE.get(source, 0.5)
+
+    def confidence_update(self, key: str, delta: float, reason: str) -> bool:
+        """Apply Bayesian confidence update and log the change."""
+        try:
+            conn = self._get_conn()
+            now = int(time.time())
+
+            row = conn.execute(
+                "SELECT confidence FROM memory_vectors WHERE key = ?", (key,)
+            ).fetchone()
+            old_conf = row[0] if row else 0.5
+            new_conf = max(0.0, min(1.0, old_conf + delta))
+
+            conn.execute(
+                "UPDATE memory_vectors SET confidence = ? WHERE key = ?",
+                (new_conf, key),
+            )
+            conn.execute(
+                "INSERT INTO confidence_log (memory_key, old_confidence, new_confidence, delta, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (key, old_conf, new_conf, delta, reason, now),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[vmem] confidence_update error: {e}")
+            return False
+
+    def confidence_get(self, key: str) -> float:
+        """Get current confidence for a memory key."""
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT confidence FROM memory_vectors WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else 0.5
+        except Exception:
+            return 0.5
+
+    def _set_initial_confidence(self, key: str, source: str, existing_confidence: float = None) -> None:
+        """Set confidence for a stored memory. Preserves existing confidence if set."""
+        try:
+            conn = self._get_conn()
+            if existing_confidence is not None:
+                # Restore existing confidence after INSERT OR REPLACE
+                conn.execute(
+                    "UPDATE memory_vectors SET confidence = ? WHERE key = ?",
+                    (existing_confidence, key),
+                )
+            else:
+                # New entry: set based on source
+                conf = self._initial_confidence(source)
+                conn.execute(
+                    "UPDATE memory_vectors SET confidence = ? WHERE key = ? AND (confidence = 0.5 OR confidence IS NULL)",
+                    (conf, key),
+                )
+            conn.commit()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 上下文管理器

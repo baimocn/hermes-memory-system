@@ -301,6 +301,41 @@ def _migrate_011_add_profile_unique_index(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Migration 012 — add confidence column to memory_vectors (CONF-01)
+# ---------------------------------------------------------------------------
+
+def _migrate_012_add_confidence_column(conn: sqlite3.Connection) -> None:
+    """012 — Add confidence REAL DEFAULT 0.5 to memory_vectors."""
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(memory_vectors)").fetchall()}
+    if "confidence" not in columns:
+        conn.execute("ALTER TABLE memory_vectors ADD COLUMN confidence REAL DEFAULT 0.5")
+
+
+# ---------------------------------------------------------------------------
+# Migration 013 — confidence_log table (CONF-05)
+# ---------------------------------------------------------------------------
+
+def _migrate_013_create_confidence_log(conn: sqlite3.Connection) -> None:
+    """013 — confidence_log table for tracking confidence changes."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS confidence_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_key TEXT NOT NULL,
+            old_confidence REAL,
+            new_confidence REAL NOT NULL,
+            delta REAL NOT NULL,
+            reason TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (memory_key) REFERENCES memory_vectors(key)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_confidence_log_key
+        ON confidence_log(memory_key)
+    """)
+
+
+# ---------------------------------------------------------------------------
 # MIGRATIONS registry
 # ---------------------------------------------------------------------------
 
@@ -316,6 +351,8 @@ MIGRATIONS = [
     ("009_decay_state", _migrate_009),
     ("010_cleanup_memory_vectors", _migrate_010_cleanup_memory_vectors),
     ("011_profile_unique_index", _migrate_011_add_profile_unique_index),
+    ("012_add_confidence_column", _migrate_012_add_confidence_column),
+    ("013_create_confidence_log", _migrate_013_create_confidence_log),
 ]
 
 

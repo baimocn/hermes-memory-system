@@ -3,9 +3,11 @@
 SQLite + FTS5 + numpy 余弦相似度 + sentence-transformers embedding
 """
 
+import base64
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -19,7 +21,10 @@ import numpy as np
 class EmbeddingEngine:
     """基于 sentence-transformers 的嵌入引擎，输出 float32[512] 归一化向量。"""
 
-    def __init__(self, model_path: str = r"C:\Users\35955\bge-small-zh-v1.5"):
+    def __init__(self, model_path: str = None):
+        if model_path is None:
+            from vmem.config import MODEL_PATH
+            model_path = MODEL_PATH
         self._model_path = model_path
         self._model = None
 
@@ -47,6 +52,111 @@ class EmbeddingEngine:
 
 
 # ---------------------------------------------------------------------------
+# ConnectionPool — 线程安全的 SQLite 连接池
+# ---------------------------------------------------------------------------
+
+class ConnectionPool:
+    """
+    线程安全的 SQLite 连接池。
+
+    每个线程获得独立的连接（SQLite 连接不是线程安全的）。
+    支持连接健康检查，自动重建失效连接。
+    使用 threading.Lock 保护池的内部状态。
+
+    Args:
+        db_path: SQLite 数据库文件路径。
+        max_connections: 最大连接数（默认 3）。实际按线程 ID 管理，
+                         此参数限制池的总容量，超出后关闭最久未使用的。
+    """
+
+    def __init__(self, db_path: str, max_connections: int = 3):
+        self._db_path = db_path
+        self._max = max_connections
+        self._lock = threading.Lock()
+        # key: thread_id, value: (connection, last_used_timestamp)
+        self._pool: Dict[int, tuple] = {}
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """创建一个新的 SQLite 连接并配置 PRAGMA。"""
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _is_connection_alive(self, conn: sqlite3.Connection) -> bool:
+        """检查连接是否仍然有效。"""
+        try:
+            conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
+
+    def get(self) -> sqlite3.Connection:
+        """
+        获取当前线程的连接。
+
+        如果当前线程已有有效连接则复用；否则创建新连接。
+        如果池已满，关闭最久未使用的连接以腾出空间。
+        """
+        tid = threading.get_ident()
+        with self._lock:
+            entry = self._pool.get(tid)
+            if entry is not None:
+                conn, _ = entry
+                if self._is_connection_alive(conn):
+                    # 更新使用时间
+                    self._pool[tid] = (conn, time.time())
+                    return conn
+                # 连接失效，移除
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                del self._pool[tid]
+
+            # 需要新建连接
+            if len(self._pool) >= self._max:
+                # 驱逐最久未使用的
+                oldest_tid = min(self._pool, key=lambda t: self._pool[t][1])
+                old_conn, _ = self._pool.pop(oldest_tid)
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
+
+            conn = self._create_connection()
+            self._pool[tid] = (conn, time.time())
+            return conn
+
+    def close_all(self) -> None:
+        """关闭池中所有连接。"""
+        with self._lock:
+            for conn, _ in self._pool.values():
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._pool.clear()
+
+    def close_current(self) -> None:
+        """关闭当前线程的连接（如果存在）。"""
+        tid = threading.get_ident()
+        with self._lock:
+            entry = self._pool.pop(tid, None)
+            if entry is not None:
+                try:
+                    entry[0].close()
+                except Exception:
+                    pass
+
+    @property
+    def size(self) -> int:
+        """当前池中的连接数。"""
+        with self._lock:
+            return len(self._pool)
+
+
+# ---------------------------------------------------------------------------
 # MemoryVectorStore
 # ---------------------------------------------------------------------------
 
@@ -58,14 +168,26 @@ class MemoryVectorStore:
     - 融合搜索: 0.60*向量 + 0.25*全文 + 0.15*时间衰减
     """
 
-    DB_PATH = r"C:\Users\35955\.claude\memory\vmem.db"
+    DB_PATH = None  # 由 config 模块提供默认值
     EMBED_DIM = 512
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_MS = [50, 100, 200]  # 指数退避（毫秒）
 
-    def __init__(self, db_path: Optional[str] = None, embedding_engine: Optional[EmbeddingEngine] = None):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        embedding_engine: Optional[EmbeddingEngine] = None,
+        max_connections: int = 3,
+    ):
+        if db_path is None:
+            from vmem.config import DB_PATH
+            db_path = DB_PATH
         self._db_path = db_path or self.DB_PATH
         os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
 
         self._engine = embedding_engine or EmbeddingEngine()
+        self._pool = ConnectionPool(self._db_path, max_connections=max_connections)
+        # 保留 _conn 属性用于向后兼容（初始化为 None，按需从 pool 获取）
         self._conn: Optional[sqlite3.Connection] = None
         self._topic_counter = 0  # tracks new memories since last topic recalc
 
@@ -76,11 +198,8 @@ class MemoryVectorStore:
     # ------------------------------------------------------------------
 
     def _get_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(self._db_path, timeout=10)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-        return self._conn
+        """从连接池获取当前线程的连接。"""
+        return self._pool.get()
 
     def _init_db(self):
         conn = self._get_conn()
@@ -121,30 +240,101 @@ class MemoryVectorStore:
         tags: str = "",
         related: Optional[List[str]] = None,
         embedding: Optional[np.ndarray] = None,
+        project: str = "",
     ) -> bool:
         """
         INSERT OR REPLACE 一条记忆。
         如果未提供 embedding，自动用 EmbeddingEngine 编码 value。
         注意：level 参数名保持不变（向后兼容），写入 importance 列。
-        """
-        try:
-            now = int(time.time())
+        project 参数用于项目隔离：空字符串表示全局记忆。
 
+        所有后续操作（FTS 同步、自动关联、置信度初始化、衰减初始化、话题聚类）
+        都在同一个事务中完成，支持最多 3 次重试（指数退避 50ms/100ms/200ms）。
+        写入失败时记录错误日志但不抛异常，保证 Hook 不中断主流程。
+        """
+        # Encoding is done outside the retry loop (it's I/O-bound, not DB-bound)
+        try:
             if embedding is None:
                 embedding = self._engine.encode([value])[0]
-            embedding = embedding.astype(np.float32).tobytes()
+            embedding_blob = embedding.astype(np.float32).tobytes()
+        except Exception as e:
+            print(f"[vmem] store encoding error: {e}")
+            return False
 
-            related_json = json.dumps(related or [], ensure_ascii=False)
+        related_json = json.dumps(related or [], ensure_ascii=False)
 
-            # Convert tags to JSON array (D-07)
-            if isinstance(tags, str) and tags:
-                tags_json = json.dumps([t.strip() for t in tags.split(",") if t.strip()], ensure_ascii=False)
-            elif isinstance(tags, list):
-                tags_json = json.dumps(tags, ensure_ascii=False)
-            else:
-                tags_json = "[]"
+        # Convert tags to JSON array (D-07)
+        if isinstance(tags, str) and tags:
+            tags_json = json.dumps([t.strip() for t in tags.split(",") if t.strip()], ensure_ascii=False)
+        elif isinstance(tags, list):
+            tags_json = json.dumps(tags, ensure_ascii=False)
+        else:
+            tags_json = "[]"
 
-            conn = self._get_conn()
+        # FTS tags string
+        if isinstance(tags, str):
+            fts_tags = tags
+        elif isinstance(tags, list):
+            fts_tags = ",".join(tags)
+        else:
+            fts_tags = ""
+
+        # Retry loop with exponential backoff
+        last_error = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                self._store_transaction(
+                    key=key,
+                    value=value,
+                    source=source,
+                    level=level,
+                    tags_json=tags_json,
+                    fts_tags=fts_tags,
+                    related_json=related_json,
+                    embedding_blob=embedding_blob,
+                    project=project,
+                )
+                return True
+            except sqlite3.OperationalError as e:
+                last_error = e
+                if attempt < self.MAX_RETRIES - 1:
+                    backoff = self.RETRY_BACKOFF_MS[attempt] / 1000.0
+                    time.sleep(backoff)
+                    continue
+                break
+            except Exception as e:
+                last_error = e
+                break
+
+        print(f"[vmem] store error (after {self.MAX_RETRIES} retries): {last_error}")
+        return False
+
+    def _store_transaction(
+        self,
+        key: str,
+        value: str,
+        source: str,
+        level: str,
+        tags_json: str,
+        fts_tags: str,
+        related_json: str,
+        embedding_blob: bytes,
+        project: str = "",
+    ) -> None:
+        """
+        在一个事务内完成 store 的所有数据库操作。
+
+        包括：memory_vectors 插入、FTS 同步、自动关联、置信度初始化、
+        衰减初始化、话题聚类。
+
+        使用 BEGIN IMMEDIATE 提前获取写锁，避免死锁。
+        调用方负责重试和错误处理。
+        """
+        conn = self._get_conn()
+        now = int(time.time())
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             # 查旧记录的 created_at 和 confidence（Phase 5: 保留已有置信度）
             row = conn.execute(
                 "SELECT created_at, confidence FROM memory_vectors WHERE key = ?",
@@ -156,41 +346,192 @@ class MemoryVectorStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO memory_vectors
-                    (key, value, source, importance, tags, related, embedding, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (key, value, source, importance, tags, related, embedding, created_at, updated_at, project)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (key, value, source, level, tags_json, related_json, embedding, created_at, now),
+                (key, value, source, level, tags_json, related_json,
+                 embedding_blob, created_at, now, project),
             )
 
             # 同步 FTS（FTS5 用自己的列名，不受 rename 影响）
             conn.execute("DELETE FROM memory_fts WHERE key = ?", (key,))
             conn.execute(
                 "INSERT INTO memory_fts (key, value, source, tags) VALUES (?, ?, ?, ?)",
-                (key, value, source, tags if isinstance(tags, str) else ",".join(tags) if isinstance(tags, list) else ""),
+                (key, value, source, fts_tags),
             )
 
-            conn.commit()
-
             # Auto-detect contradictions and create links (Phase 4)
-            self._auto_link_on_store(key, value, embedding)
+            self._auto_link_on_store_tx(conn, key, value, embedding_blob)
 
             # Set initial confidence based on source (Phase 5)
-            self._set_initial_confidence(key, source, existing_confidence)
+            self._set_initial_confidence_tx(conn, key, source, existing_confidence)
 
             # Initialize decay state (Phase 6)
-            self.decay_init(key, source)
+            self._decay_init_tx(conn, key, source)
 
             # Auto-cluster into topics (Phase 7)
-            if embedding is not None:
+            if embedding_blob is not None:
                 try:
-                    self._auto_cluster(key, value, embedding)
+                    self._auto_cluster_tx(conn, key, value, embedding_blob)
                 except Exception:
                     pass
 
-            return True
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
-        except Exception as e:
-            print(f"[vmem] store error: {e}")
+    def _auto_link_on_store_tx(self, conn, key: str, value: str,
+                                embedding: bytes) -> None:
+        """事务内版本：Auto-create supersedes and contradiction links after store()."""
+        try:
+            if embedding is not None:
+                contradictions = self._detect_contradictions(key, embedding)
+                for c in contradictions:
+                    self._link_add_tx(conn, key, c["key"], "contradicts", c["similarity"])
+        except Exception:
+            pass  # link failures must not break store()
+
+    def _link_add_tx(self, conn, from_key: str, to_key: str,
+                     link_type: str, strength: float = 1.0) -> bool:
+        """事务内版本：Add a typed link between two memories."""
+        if link_type not in self.VALID_LINK_TYPES:
+            return False
+        # Avoid duplicates
+        existing = conn.execute(
+            "SELECT id FROM memory_links WHERE from_id = ? AND to_id = ? AND link_type = ?",
+            (from_key, to_key, link_type),
+        ).fetchone()
+        if existing:
+            return True
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO memory_links (from_id, to_id, link_type, strength, created_at) VALUES (?, ?, ?, ?, ?)",
+            (from_key, to_key, link_type, strength, now),
+        )
+        return True
+
+    def _set_initial_confidence_tx(self, conn, key: str, source: str,
+                                    existing_confidence: float = None) -> None:
+        """事务内版本：Set confidence for a stored memory."""
+        try:
+            if existing_confidence is not None:
+                conn.execute(
+                    "UPDATE memory_vectors SET confidence = ? WHERE key = ?",
+                    (existing_confidence, key),
+                )
+            else:
+                conf = self._initial_confidence(source)
+                conn.execute(
+                    "UPDATE memory_vectors SET confidence = ? WHERE key = ? AND (confidence = 0.5 OR confidence IS NULL)",
+                    (conf, key),
+                )
+        except Exception:
+            pass
+
+    def _decay_init_tx(self, conn, key: str, source: str = "") -> bool:
+        """事务内版本：Initialize decay_state for a memory."""
+        try:
+            now = int(time.time())
+            row = conn.execute(
+                "SELECT source, importance FROM memory_vectors WHERE key = ?", (key,)
+            ).fetchone()
+            mem_source = row[0] if row else source
+            mem_importance = row[1] if row else ""
+            stability = self._base_stability(mem_source, mem_importance)
+            conn.execute(
+                """INSERT OR IGNORE INTO decay_state
+                   (memory_key, difficulty, stability, retrievability, last_review)
+                   VALUES (?, 0.0, ?, 1.0, ?)""",
+                (key, stability, now),
+            )
+            return True
+        except Exception:
+            return False
+
+    def _auto_cluster_tx(self, conn, key: str, value: str, embedding_blob: bytes) -> None:
+        """事务内版本：Auto-cluster a memory into a topic."""
+        # Convert blob to array for matching
+        try:
+            emb = np.frombuffer(embedding_blob, dtype=np.float32)
+            if emb.shape[0] != self.EMBED_DIM:
+                return
+        except Exception:
+            return
+
+        topic_id, sim = self._topic_match_tx(conn, emb)
+        if topic_id is not None:
+            self._topic_add_memory_tx(conn, topic_id, key)
+        else:
+            name = value[:50].replace("\n", " ").strip()
+            if not name:
+                name = f"topic_{key}"
+            topic_id = self._topic_create_tx(conn, name, embedding_blob)
+            if topic_id > 0:
+                self._topic_add_memory_tx(conn, topic_id, key)
+
+        self._topic_counter += 1
+        if self._topic_counter >= self.TOPIC_RECALC_INTERVAL:
+            self._recalculate_all_topics()
+            self._topic_counter = 0
+
+    def _topic_match_tx(self, conn, embedding: np.ndarray) -> tuple:
+        """事务内版本：Find best matching topic for an embedding."""
+        try:
+            rows = conn.execute(
+                "SELECT id, centroid FROM topics WHERE centroid IS NOT NULL"
+            ).fetchall()
+            if not rows:
+                return (None, 0.0)
+
+            query_emb = np.asarray(embedding, dtype=np.float32).flatten()
+            best_id = None
+            best_sim = 0.0
+
+            for topic_id, centroid_blob in rows:
+                try:
+                    centroid = np.frombuffer(centroid_blob, dtype=np.float32)
+                    if centroid.shape[0] != self.EMBED_DIM:
+                        continue
+                    sim = float(np.dot(query_emb, centroid))
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_id = topic_id
+                except Exception:
+                    continue
+
+            if best_sim >= self.TOPIC_MATCH_THRESHOLD:
+                return (best_id, best_sim)
+            return (None, best_sim)
+        except Exception:
+            return (None, 0.0)
+
+    def _topic_create_tx(self, conn, name: str, centroid_blob: bytes) -> int:
+        """事务内版本：Create a new topic. Returns topic id."""
+        try:
+            now = int(time.time())
+            cur = conn.execute(
+                "INSERT INTO topics (name, centroid, session_count, created_at) VALUES (?, ?, 0, ?)",
+                (name, centroid_blob, now),
+            )
+            return cur.lastrowid
+        except Exception:
+            return -1
+
+    def _topic_add_memory_tx(self, conn, topic_id: int, key: str) -> bool:
+        """事务内版本：Link a memory to a topic."""
+        try:
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO session_topics (session_id, topic_id, similarity, created_at) VALUES (?, ?, 1.0, ?)",
+                (key, topic_id, now),
+            )
+            conn.execute(
+                "UPDATE topics SET session_count = session_count + 1 WHERE id = ?",
+                (topic_id,),
+            )
+            return True
+        except Exception:
             return False
 
     def search(self, query_emb: np.ndarray, top_k: int = 10) -> List[Dict[str, Any]]:
@@ -297,7 +638,7 @@ class MemoryVectorStore:
             rows = conn.execute(
                 """
                 SELECT key, value, source, importance, tags, related, embedding,
-                       created_at, updated_at, COALESCE(confidence, 0.5)
+                       created_at, updated_at, COALESCE(confidence, 0.5), COALESCE(project, '')
                 FROM memory_vectors WHERE embedding IS NOT NULL
                 """
             ).fetchall()
@@ -401,7 +742,7 @@ class MemoryVectorStore:
             full_rows = conn.execute(
                 f"""
                 SELECT key, value, source, importance, tags, related,
-                       created_at, updated_at
+                       created_at, updated_at, COALESCE(project, '')
                 FROM memory_vectors WHERE key IN ({placeholders})
                 """,
                 top_keys,
@@ -425,6 +766,7 @@ class MemoryVectorStore:
                     "created_at": r[6],
                     "updated_at": r[7],
                     "score": score_map.get(key, 0.0),
+                    "project": r[8],
                 })
 
             return results
@@ -438,7 +780,7 @@ class MemoryVectorStore:
         try:
             conn = self._get_conn()
             row = conn.execute(
-                "SELECT key, value, source, importance, tags, related, created_at, updated_at "
+                "SELECT key, value, source, importance, tags, related, created_at, updated_at, COALESCE(project, '') "
                 "FROM memory_vectors WHERE key = ?",
                 (key,),
             ).fetchone()
@@ -455,6 +797,7 @@ class MemoryVectorStore:
                 "related": json.loads(row[5]) if row[5] else [],
                 "created_at": row[6],
                 "updated_at": row[7],
+                "project": row[8],
             }
 
         except Exception as e:
@@ -1385,13 +1728,901 @@ class MemoryVectorStore:
             return {"error": str(e)}
 
     # ------------------------------------------------------------------
+    # 快照与恢复 (Snapshot & Restore)
+    # ------------------------------------------------------------------
+
+    def snapshot_export(self, output_path: str) -> Dict[str, Any]:
+        """
+        Export all memory data to a JSON snapshot file.
+
+        Exports memory_vectors (with base64-encoded embeddings), causal_links,
+        memory_links, topics (with base64-encoded centroids), and session_topics.
+
+        The file includes metadata: export timestamp, record count, and schema
+        version (latest migration name from schema_migrations).
+
+        Returns a dict with summary info (record_count, path, schema_version).
+        """
+        conn = self._get_conn()
+
+        # --- memory_vectors ---
+        rows = conn.execute(
+            "SELECT key, value, source, importance, tags, related, embedding, "
+            "confidence, created_at, updated_at FROM memory_vectors"
+        ).fetchall()
+
+        memory_vectors = []
+        for r in rows:
+            emb_b64 = base64.b64encode(r[6]).decode("ascii") if r[6] is not None else None
+            memory_vectors.append({
+                "key": r[0],
+                "value": r[1],
+                "source": r[2],
+                "importance": r[3],
+                "tags": r[4],
+                "related": r[5],
+                "embedding_b64": emb_b64,
+                "confidence": r[7],
+                "created_at": r[8],
+                "updated_at": r[9],
+            })
+
+        # --- causal_links ---
+        causal_rows = conn.execute(
+            "SELECT id, from_id, to_id, relation, strength, created_at FROM causal_links"
+        ).fetchall()
+        causal_links = [
+            {"id": r[0], "from_id": r[1], "to_id": r[2],
+             "relation": r[3], "strength": r[4], "created_at": r[5]}
+            for r in causal_rows
+        ]
+
+        # --- memory_links ---
+        link_rows = conn.execute(
+            "SELECT id, from_id, to_id, link_type, strength, created_at FROM memory_links"
+        ).fetchall()
+        memory_links = [
+            {"id": r[0], "from_id": r[1], "to_id": r[2],
+             "link_type": r[3], "strength": r[4], "created_at": r[5]}
+            for r in link_rows
+        ]
+
+        # --- topics (centroid is BLOB, base64 encode) ---
+        topic_rows = conn.execute(
+            "SELECT id, name, centroid, session_count, created_at FROM topics"
+        ).fetchall()
+        topics = []
+        for r in topic_rows:
+            centroid_b64 = base64.b64encode(r[2]).decode("ascii") if r[2] is not None else None
+            topics.append({
+                "id": r[0],
+                "name": r[1],
+                "centroid_b64": centroid_b64,
+                "session_count": r[3],
+                "created_at": r[4],
+            })
+
+        # --- session_topics ---
+        st_rows = conn.execute(
+            "SELECT id, session_id, topic_id, similarity, created_at FROM session_topics"
+        ).fetchall()
+        session_topics = [
+            {"id": r[0], "session_id": r[1], "topic_id": r[2],
+             "similarity": r[3], "created_at": r[4]}
+            for r in st_rows
+        ]
+
+        # --- schema version: latest applied migration ---
+        latest_version = None
+        try:
+            row = conn.execute(
+                "SELECT migration_name FROM schema_migrations ORDER BY migration_name DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                latest_version = row[0]
+        except Exception:
+            pass
+
+        snapshot = {
+            "meta": {
+                "exported_at": int(time.time()),
+                "record_count": len(memory_vectors),
+                "schema_version": latest_version,
+            },
+            "memory_vectors": memory_vectors,
+            "causal_links": causal_links,
+            "memory_links": memory_links,
+            "topics": topics,
+            "session_topics": session_topics,
+        }
+
+        # Write to file
+        output_path = str(output_path)
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+
+        return {
+            "path": output_path,
+            "record_count": len(memory_vectors),
+            "causal_link_count": len(causal_links),
+            "memory_link_count": len(memory_links),
+            "topic_count": len(topics),
+            "session_topic_count": len(session_topics),
+            "schema_version": latest_version,
+        }
+
+    def snapshot_import(self, json_path: str, mode: str = "merge") -> Dict[str, Any]:
+        """
+        Import memory data from a JSON snapshot file.
+
+        Args:
+            json_path: Path to the snapshot JSON file.
+            mode: Import strategy:
+                - "merge": Skip records whose key already exists (default).
+                - "overwrite": Clear all data first, then import everything.
+                - "upsert": For each key, keep the record with the newer
+                            updated_at timestamp.
+
+        Returns a dict with import statistics.
+
+        After import, FTS5 index is rebuilt and migrations are re-run to
+        ensure schema compatibility.
+        """
+        if mode not in ("merge", "overwrite", "upsert"):
+            raise ValueError(f"Invalid mode '{mode}'. Must be merge, overwrite, or upsert.")
+
+        # Read and parse snapshot file
+        json_path = str(json_path)
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                snapshot = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Snapshot file not found: {json_path}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in snapshot file: {e}")
+
+        if not isinstance(snapshot, dict) or "memory_vectors" not in snapshot:
+            raise ValueError("Snapshot file missing 'memory_vectors' field.")
+
+        conn = self._get_conn()
+
+        memory_vectors = snapshot.get("memory_vectors", [])
+        causal_links = snapshot.get("causal_links", [])
+        memory_links = snapshot.get("memory_links", [])
+        topics = snapshot.get("topics", [])
+        session_topics = snapshot.get("session_topics", [])
+
+        stats = {
+            "imported": 0,
+            "skipped": 0,
+            "overwritten": 0,
+            "causal_links_imported": 0,
+            "memory_links_imported": 0,
+            "topics_imported": 0,
+            "session_topics_imported": 0,
+            "mode": mode,
+        }
+
+        try:
+            # --- mode=overwrite: clear all data first ---
+            if mode == "overwrite":
+                conn.execute("DELETE FROM session_topics")
+                conn.execute("DELETE FROM topics")
+                conn.execute("DELETE FROM memory_links")
+                conn.execute("DELETE FROM causal_links")
+                conn.execute("DELETE FROM closure_table")
+                conn.execute("DELETE FROM memory_fts")
+                conn.execute("DELETE FROM memory_vectors")
+
+            # --- import memory_vectors ---
+            existing_keys = set()
+            existing_updated = {}
+            if mode != "overwrite":
+                rows = conn.execute(
+                    "SELECT key, updated_at FROM memory_vectors"
+                ).fetchall()
+                for r in rows:
+                    existing_keys.add(r[0])
+                    existing_updated[r[0]] = r[1]
+
+            for rec in memory_vectors:
+                key = rec.get("key")
+                if not key:
+                    continue
+
+                # Decode embedding
+                emb_b64 = rec.get("embedding_b64")
+                embedding = base64.b64decode(emb_b64) if emb_b64 else None
+
+                value = rec.get("value", "")
+                source = rec.get("source", "")
+                importance = rec.get("importance", "")
+                tags = rec.get("tags", "[]")
+                related = rec.get("related", "[]")
+                confidence = rec.get("confidence", 0.5)
+                created_at = rec.get("created_at", int(time.time()))
+                updated_at = rec.get("updated_at", int(time.time()))
+
+                if mode == "overwrite":
+                    # Full import — just insert
+                    conn.execute(
+                        """INSERT INTO memory_vectors
+                           (key, value, source, importance, tags, related, embedding,
+                            confidence, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (key, value, source, importance, tags, related, embedding,
+                         confidence, created_at, updated_at),
+                    )
+                    stats["imported"] += 1
+
+                elif mode == "merge":
+                    # Skip existing keys
+                    if key in existing_keys:
+                        stats["skipped"] += 1
+                        continue
+                    conn.execute(
+                        """INSERT INTO memory_vectors
+                           (key, value, source, importance, tags, related, embedding,
+                            confidence, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (key, value, source, importance, tags, related, embedding,
+                         confidence, created_at, updated_at),
+                    )
+                    stats["imported"] += 1
+
+                elif mode == "upsert":
+                    # Keep the newer record by updated_at
+                    if key in existing_keys:
+                        if updated_at > existing_updated[key]:
+                            conn.execute(
+                                """UPDATE memory_vectors SET
+                                   value = ?, source = ?, importance = ?, tags = ?,
+                                   related = ?, embedding = ?, confidence = ?,
+                                   created_at = ?, updated_at = ?
+                                   WHERE key = ?""",
+                                (value, source, importance, tags, related, embedding,
+                                 confidence, created_at, updated_at, key),
+                            )
+                            stats["overwritten"] += 1
+                        else:
+                            stats["skipped"] += 1
+                    else:
+                        conn.execute(
+                            """INSERT INTO memory_vectors
+                               (key, value, source, importance, tags, related, embedding,
+                                confidence, created_at, updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (key, value, source, importance, tags, related, embedding,
+                             confidence, created_at, updated_at),
+                        )
+                        stats["imported"] += 1
+
+            # --- rebuild FTS5 index ---
+            conn.execute("DELETE FROM memory_fts")
+            fts_rows = conn.execute(
+                "SELECT key, value, source, tags FROM memory_vectors"
+            ).fetchall()
+            for r in fts_rows:
+                # For FTS, convert tags JSON back to comma-separated for trigram matching
+                tags_str = r[3] or ""
+                try:
+                    tag_list = json.loads(tags_str)
+                    if isinstance(tag_list, list):
+                        tags_str = ",".join(tag_list)
+                except (json.JSONDecodeError, TypeError):
+                    pass  # keep as-is
+                conn.execute(
+                    "INSERT INTO memory_fts (key, value, source, tags) VALUES (?, ?, ?, ?)",
+                    (r[0], r[1], r[2], tags_str),
+                )
+
+            # --- import topics ---
+            if mode == "overwrite":
+                for t in topics:
+                    centroid = base64.b64decode(t["centroid_b64"]) if t.get("centroid_b64") else None
+                    conn.execute(
+                        """INSERT INTO topics (id, name, centroid, session_count, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (t.get("id"), t.get("name", ""), centroid,
+                         t.get("session_count", 0), t.get("created_at", int(time.time()))),
+                    )
+                    stats["topics_imported"] += 1
+            else:
+                # For merge/upsert: only import topics that don't exist by id
+                existing_topic_ids = {
+                    r[0] for r in conn.execute("SELECT id FROM topics").fetchall()
+                }
+                for t in topics:
+                    tid = t.get("id")
+                    if tid in existing_topic_ids:
+                        continue
+                    centroid = base64.b64decode(t["centroid_b64"]) if t.get("centroid_b64") else None
+                    conn.execute(
+                        """INSERT INTO topics (id, name, centroid, session_count, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (tid, t.get("name", ""), centroid,
+                         t.get("session_count", 0), t.get("created_at", int(time.time()))),
+                    )
+                    stats["topics_imported"] += 1
+
+            # --- import session_topics ---
+            if mode == "overwrite":
+                for st in session_topics:
+                    conn.execute(
+                        """INSERT INTO session_topics
+                           (id, session_id, topic_id, similarity, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (st.get("id"), st.get("session_id", ""), st.get("topic_id", 0),
+                         st.get("similarity", 0.0), st.get("created_at", int(time.time()))),
+                    )
+                    stats["session_topics_imported"] += 1
+            else:
+                # For merge/upsert: skip by (session_id, topic_id) to avoid duplicates
+                existing_st_pairs = {
+                    (r[0], r[1])
+                    for r in conn.execute(
+                        "SELECT session_id, topic_id FROM session_topics"
+                    ).fetchall()
+                }
+                for st in session_topics:
+                    pair = (st.get("session_id", ""), st.get("topic_id", 0))
+                    if pair in existing_st_pairs:
+                        continue
+                    conn.execute(
+                        """INSERT INTO session_topics
+                           (session_id, topic_id, similarity, created_at)
+                           VALUES (?, ?, ?, ?)""",
+                        (st.get("session_id", ""), st.get("topic_id", 0),
+                         st.get("similarity", 0.0), st.get("created_at", int(time.time()))),
+                    )
+                    stats["session_topics_imported"] += 1
+
+            # --- import causal_links ---
+            if mode == "overwrite":
+                for cl in causal_links:
+                    conn.execute(
+                        """INSERT INTO causal_links
+                           (from_id, to_id, relation, strength, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (cl.get("from_id", ""), cl.get("to_id", ""),
+                         cl.get("relation", ""), cl.get("strength", 1.0),
+                         cl.get("created_at", int(time.time()))),
+                    )
+                    stats["causal_links_imported"] += 1
+                # Rebuild closure_table for overwrite mode
+                self._rebuild_closure_table(conn)
+            else:
+                # For merge/upsert: skip duplicate (from_id, to_id, relation) triples
+                existing_cl = {
+                    (r[0], r[1], r[2])
+                    for r in conn.execute(
+                        "SELECT from_id, to_id, relation FROM causal_links"
+                    ).fetchall()
+                }
+                for cl in causal_links:
+                    triple = (cl.get("from_id", ""), cl.get("to_id", ""), cl.get("relation", ""))
+                    if triple in existing_cl:
+                        continue
+                    conn.execute(
+                        """INSERT INTO causal_links
+                           (from_id, to_id, relation, strength, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (cl.get("from_id", ""), cl.get("to_id", ""),
+                         cl.get("relation", ""), cl.get("strength", 1.0),
+                         cl.get("created_at", int(time.time()))),
+                    )
+                    stats["causal_links_imported"] += 1
+                # Rebuild closure_table incrementally not needed — full rebuild is safer
+                if stats["causal_links_imported"] > 0:
+                    self._rebuild_closure_table(conn)
+
+            # --- import memory_links ---
+            if mode == "overwrite":
+                for ml in memory_links:
+                    conn.execute(
+                        """INSERT INTO memory_links
+                           (from_id, to_id, link_type, strength, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (ml.get("from_id", ""), ml.get("to_id", ""),
+                         ml.get("link_type", ""), ml.get("strength", 1.0),
+                         ml.get("created_at", int(time.time()))),
+                    )
+                    stats["memory_links_imported"] += 1
+            else:
+                # For merge/upsert: skip duplicate (from_id, to_id, link_type)
+                existing_ml = {
+                    (r[0], r[1], r[2])
+                    for r in conn.execute(
+                        "SELECT from_id, to_id, link_type FROM memory_links"
+                    ).fetchall()
+                }
+                for ml in memory_links:
+                    triple = (ml.get("from_id", ""), ml.get("to_id", ""), ml.get("link_type", ""))
+                    if triple in existing_ml:
+                        continue
+                    conn.execute(
+                        """INSERT INTO memory_links
+                           (from_id, to_id, link_type, strength, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (ml.get("from_id", ""), ml.get("to_id", ""),
+                         ml.get("link_type", ""), ml.get("strength", 1.0),
+                         ml.get("created_at", int(time.time()))),
+                    )
+                    stats["memory_links_imported"] += 1
+
+            conn.commit()
+
+            # --- run migrations to ensure schema compatibility ---
+            from vmem.migrations import run_migrations
+            run_migrations(conn)
+
+            return stats
+
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _rebuild_closure_table(self, conn: sqlite3.Connection) -> None:
+        """Rebuild closure_table from all causal_links."""
+        conn.execute("DELETE FROM closure_table")
+        # Self-references (depth 0)
+        conn.execute(
+            """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+               SELECT from_id, from_id, 0 FROM causal_links
+               UNION
+               SELECT to_id, to_id, 0 FROM causal_links"""
+        )
+        # Direct links (depth 1)
+        conn.execute(
+            """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+               SELECT from_id, to_id, 1 FROM causal_links"""
+        )
+        # Iterative transitive closure
+        for _ in range(10):
+            result = conn.execute(
+                """INSERT OR IGNORE INTO closure_table (ancestor, descendant, depth)
+                   SELECT a.ancestor, d.descendant, a.depth + d.depth
+                   FROM closure_table a
+                   JOIN closure_table d ON a.descendant = d.ancestor AND d.depth > 0
+                   WHERE a.depth > 0
+                     AND NOT EXISTS (
+                       SELECT 1 FROM closure_table e
+                       WHERE e.ancestor = a.ancestor AND e.descendant = d.descendant
+                     )"""
+            )
+            if result.rowcount == 0:
+                break
+
+    # ------------------------------------------------------------------
+    # 记忆去重与智能合并 (Phase 9: Deduplication & Smart Merge)
+    # ------------------------------------------------------------------
+
+    def find_duplicates(self, threshold: float = 0.92, chunk_size: int = 1000) -> List[Dict[str, Any]]:
+        """
+        基于向量余弦相似度查找重复记忆对。
+
+        使用 numpy 矩阵运算批量计算相似度。当记录数超过 10000 时，
+        采用分块（chunk_size=1000）策略以控制内存使用。
+
+        Args:
+            threshold: 相似度阈值，默认 0.92（高于此值视为重复）。
+            chunk_size: 分块大小，默认 1000。仅当总记录数 > 10000 时分块生效。
+
+        Returns:
+            List of dicts: [{"key_a": str, "key_b": str, "similarity": float}, ...]
+            每对只出现一次（按 key 字典序排序，key_a < key_b）。
+        """
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT key, embedding FROM memory_vectors WHERE embedding IS NOT NULL"
+            ).fetchall()
+
+            if len(rows) < 2:
+                return []
+
+            # 收集所有 key 和 embedding
+            keys = []
+            embeddings = []
+            for key, emb_blob in rows:
+                try:
+                    emb = np.frombuffer(emb_blob, dtype=np.float32)
+                    if emb.shape[0] != self.EMBED_DIM:
+                        continue
+                    keys.append(key)
+                    embeddings.append(emb)
+                except Exception:
+                    continue
+
+            n = len(keys)
+            if n < 2:
+                return []
+
+            emb_matrix = np.stack(embeddings).astype(np.float32)  # shape: (n, 512)
+
+            # 小数据集：直接全矩阵运算
+            if n <= 10000:
+                # 归一化向量已在 encode 时完成，cosine = dot product
+                sim_matrix = emb_matrix @ emb_matrix.T  # shape: (n, n)
+
+                # 获取上三角（不含对角线）的高相似度对
+                iu = np.triu_indices(n, k=1)
+                sims = sim_matrix[iu]
+                mask = sims >= threshold
+
+                i_indices = iu[0][mask]
+                j_indices = iu[1][mask]
+                sim_values = sims[mask]
+
+                results = []
+                for i, j, s in zip(i_indices, j_indices, sim_values):
+                    ka, kb = keys[i], keys[j]
+                    # 按字典序排序确保 key_a < key_b
+                    if ka > kb:
+                        ka, kb = kb, ka
+                    results.append({
+                        "key_a": ka,
+                        "key_b": kb,
+                        "similarity": float(s),
+                    })
+
+                # 按相似度降序排序
+                results.sort(key=lambda x: x["similarity"], reverse=True)
+                return results
+
+            # 大数据集：分块计算以控制内存
+            results = []
+            for i_start in range(0, n, chunk_size):
+                i_end = min(i_start + chunk_size, n)
+                chunk_i = emb_matrix[i_start:i_end]  # shape: (chunk_i_size, 512)
+
+                for j_start in range(i_start + 1, n, chunk_size):
+                    j_end = min(j_start + chunk_size, n)
+                    chunk_j = emb_matrix[j_start:j_end]  # shape: (chunk_j_size, 512)
+
+                    # 块间相似度矩阵
+                    sim_block = chunk_i @ chunk_j.T  # shape: (chunk_i_size, chunk_j_size)
+
+                    # 找出高相似度对
+                    above = np.argwhere(sim_block >= threshold)
+                    for ii, jj in above:
+                        global_i = i_start + ii
+                        global_j = j_start + jj
+                        ka, kb = keys[global_i], keys[global_j]
+                        if ka > kb:
+                            ka, kb = kb, ka
+                        results.append({
+                            "key_a": ka,
+                            "key_b": kb,
+                            "similarity": float(sim_block[ii, jj]),
+                        })
+
+            results.sort(key=lambda x: x["similarity"], reverse=True)
+            return results
+
+        except Exception as e:
+            print(f"[vmem] find_duplicates error: {e}")
+            return []
+
+    def merge_memories(
+        self,
+        key_a: str,
+        key_b: str,
+        strategy: str = "keep_richer",
+    ) -> Dict[str, Any]:
+        """
+        合并两条记忆，保留一条作为幸存者，另一条被删除。
+
+        Args:
+            key_a: 第一条记忆的 key。
+            key_b: 第二条记忆的 key。
+            strategy: 合并策略：
+                - "keep_richer": 保留信息更丰富的那条（默认）
+                  评估维度：value 长度、tags 数量、关联链接数
+                - "keep_newer": 保留 updated_at 较新的那条
+                - "manual": 以 key_a 为幸存者，合并 key_b 的部分信息
+
+        Returns:
+            dict with keys: {survivor_key, merged_key, strategy,
+                             old_confidence, new_confidence,
+                             links_transferred, causal_transferred}
+        """
+        if strategy not in ("keep_richer", "keep_newer", "manual"):
+            raise ValueError(
+                f"Invalid strategy '{strategy}'. "
+                "Must be 'keep_richer', 'keep_newer', or 'manual'."
+            )
+
+        try:
+            conn = self._get_conn()
+
+            # 获取两条记忆的完整信息
+            row_a = conn.execute(
+                "SELECT key, value, source, importance, tags, related, "
+                "confidence, created_at, updated_at "
+                "FROM memory_vectors WHERE key = ?",
+                (key_a,),
+            ).fetchone()
+            row_b = conn.execute(
+                "SELECT key, value, source, importance, tags, related, "
+                "confidence, created_at, updated_at "
+                "FROM memory_vectors WHERE key = ?",
+                (key_b,),
+            ).fetchone()
+
+            if row_a is None or row_b is None:
+                return {"error": "One or both keys not found"}
+
+            mem_a = {
+                "key": row_a[0], "value": row_a[1], "source": row_a[2],
+                "importance": row_a[3], "tags": row_a[4], "related": row_a[5],
+                "confidence": row_a[6] or 0.5,
+                "created_at": row_a[7], "updated_at": row_a[8],
+            }
+            mem_b = {
+                "key": row_b[0], "value": row_b[1], "source": row_b[2],
+                "importance": row_b[3], "tags": row_b[4], "related": row_b[5],
+                "confidence": row_b[6] or 0.5,
+                "created_at": row_b[7], "updated_at": row_b[8],
+            }
+
+            # 计算 richness 分数
+            def _richness(mem: dict) -> float:
+                score = 0.0
+                score += len(mem["value"]) * 0.01  # value 长度
+                try:
+                    tag_list = json.loads(mem["tags"]) if mem["tags"] else []
+                    if isinstance(tag_list, list):
+                        score += len(tag_list) * 5
+                except Exception:
+                    pass
+                try:
+                    rel_list = json.loads(mem["related"]) if mem["related"] else []
+                    if isinstance(rel_list, list):
+                        score += len(rel_list) * 3
+                except Exception:
+                    pass
+                score += mem["confidence"] * 10
+                return score
+
+            # 确定幸存者
+            if strategy == "keep_richer":
+                if _richness(mem_a) >= _richness(mem_b):
+                    survivor, merged = mem_a, mem_b
+                else:
+                    survivor, merged = mem_b, mem_a
+            elif strategy == "keep_newer":
+                if mem_a["updated_at"] >= mem_b["updated_at"]:
+                    survivor, merged = mem_a, mem_b
+                else:
+                    survivor, merged = mem_b, mem_a
+            else:  # manual
+                survivor, merged = mem_a, mem_b
+
+            survivor_key = survivor["key"]
+            merged_key = merged["key"]
+
+            old_confidence = survivor["confidence"]
+
+            # 置信度提升 10%（上限 1.0）
+            new_confidence = min(survivor["confidence"] * 1.10, 1.0)
+
+            # 合并 tags（去重）
+            try:
+                surv_tags = json.loads(survivor["tags"]) if survivor["tags"] else []
+                if not isinstance(surv_tags, list):
+                    surv_tags = []
+            except Exception:
+                surv_tags = []
+            try:
+                merged_tags = json.loads(merged["tags"]) if merged["tags"] else []
+                if not isinstance(merged_tags, list):
+                    merged_tags = []
+            except Exception:
+                merged_tags = []
+
+            combined_tags = list(dict.fromkeys(surv_tags + merged_tags))
+            new_tags_json = json.dumps(combined_tags, ensure_ascii=False)
+
+            # 合并 related（去重）
+            try:
+                surv_rel = json.loads(survivor["related"]) if survivor["related"] else []
+                if not isinstance(surv_rel, list):
+                    surv_rel = []
+            except Exception:
+                surv_rel = []
+            try:
+                merged_rel = json.loads(merged["related"]) if merged["related"] else []
+                if not isinstance(merged_rel, list):
+                    merged_rel = []
+            except Exception:
+                merged_rel = []
+
+            combined_rel = list(dict.fromkeys(surv_rel + merged_rel))
+            # 移除幸存者自身的 key
+            combined_rel = [k for k in combined_rel if k != survivor_key and k != merged_key]
+            new_rel_json = json.dumps(combined_rel, ensure_ascii=False)
+
+            # value 合并策略：取较长的那个（richer 策略的补充）
+            # 如果幸存者的 value 明显更短，追加 merged 的 value
+            new_value = survivor["value"]
+            if len(merged["value"]) > len(survivor["value"]) * 1.5:
+                new_value = survivor["value"] + "\n\n" + merged["value"]
+
+            now = int(time.time())
+
+            # 开始事务
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # 更新幸存者
+                conn.execute(
+                    """UPDATE memory_vectors SET
+                           value = ?, tags = ?, related = ?,
+                           confidence = ?, updated_at = ?
+                       WHERE key = ?""",
+                    (new_value, new_tags_json, new_rel_json,
+                     new_confidence, now, survivor_key),
+                )
+
+                # 转移 causal_links：merged → survivor
+                # 1. merged 作为 from_id 的链接
+                causal_from = conn.execute(
+                    "SELECT to_id, relation, strength FROM causal_links WHERE from_id = ?",
+                    (merged_key,),
+                ).fetchall()
+                causal_transferred = 0
+                for to_id, relation, strength in causal_from:
+                    if to_id == survivor_key:
+                        continue  # 跳过自引用
+                    # 检查是否已存在
+                    existing = conn.execute(
+                        "SELECT id FROM causal_links WHERE from_id = ? AND to_id = ? AND relation = ?",
+                        (survivor_key, to_id, relation),
+                    ).fetchone()
+                    if not existing:
+                        conn.execute(
+                            "INSERT INTO causal_links (from_id, to_id, relation, strength, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (survivor_key, to_id, relation, strength, now),
+                        )
+                        causal_transferred += 1
+
+                # 2. merged 作为 to_id 的链接
+                causal_to = conn.execute(
+                    "SELECT from_id, relation, strength FROM causal_links WHERE to_id = ?",
+                    (merged_key,),
+                ).fetchall()
+                for from_id, relation, strength in causal_to:
+                    if from_id == survivor_key:
+                        continue
+                    existing = conn.execute(
+                        "SELECT id FROM causal_links WHERE from_id = ? AND to_id = ? AND relation = ?",
+                        (from_id, survivor_key, relation),
+                    ).fetchone()
+                    if not existing:
+                        conn.execute(
+                            "INSERT INTO causal_links (from_id, to_id, relation, strength, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (from_id, survivor_key, relation, strength, now),
+                        )
+                        causal_transferred += 1
+
+                # 删除 merged 的 causal_links
+                conn.execute(
+                    "DELETE FROM causal_links WHERE from_id = ? OR to_id = ?",
+                    (merged_key, merged_key),
+                )
+
+                # 转移 memory_links：merged → survivor
+                links_transferred = 0
+
+                # 1. merged 作为 from_id
+                link_from = conn.execute(
+                    "SELECT to_id, link_type, strength FROM memory_links WHERE from_id = ?",
+                    (merged_key,),
+                ).fetchall()
+                for to_id, link_type, strength in link_from:
+                    if to_id == survivor_key:
+                        continue
+                    existing = conn.execute(
+                        "SELECT id FROM memory_links WHERE from_id = ? AND to_id = ? AND link_type = ?",
+                        (survivor_key, to_id, link_type),
+                    ).fetchone()
+                    if not existing:
+                        conn.execute(
+                            "INSERT INTO memory_links (from_id, to_id, link_type, strength, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (survivor_key, to_id, link_type, strength, now),
+                        )
+                        links_transferred += 1
+
+                # 2. merged 作为 to_id
+                link_to = conn.execute(
+                    "SELECT from_id, link_type, strength FROM memory_links WHERE to_id = ?",
+                    (merged_key,),
+                ).fetchall()
+                for from_id, link_type, strength in link_to:
+                    if from_id == survivor_key:
+                        continue
+                    existing = conn.execute(
+                        "SELECT id FROM memory_links WHERE from_id = ? AND to_id = ? AND link_type = ?",
+                        (from_id, survivor_key, link_type),
+                    ).fetchone()
+                    if not existing:
+                        conn.execute(
+                            "INSERT INTO memory_links (from_id, to_id, link_type, strength, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (from_id, survivor_key, link_type, strength, now),
+                        )
+                        links_transferred += 1
+
+                # 删除 merged 的 memory_links
+                conn.execute(
+                    "DELETE FROM memory_links WHERE from_id = ? OR to_id = ?",
+                    (merged_key, merged_key),
+                )
+
+                # 删除 merged 在 session_topics 中的记录
+                conn.execute(
+                    "DELETE FROM session_topics WHERE session_id = ?",
+                    (merged_key,),
+                )
+
+                # 删除 merged 的 decay_state
+                conn.execute(
+                    "DELETE FROM decay_state WHERE memory_key = ?",
+                    (merged_key,),
+                )
+
+                # 删除 merged 的 FTS 记录
+                conn.execute("DELETE FROM memory_fts WHERE key = ?", (merged_key,))
+
+                # 更新幸存者的 FTS 记录
+                conn.execute("DELETE FROM memory_fts WHERE key = ?", (survivor_key,))
+                fts_tags = ",".join(combined_tags)
+                conn.execute(
+                    "INSERT INTO memory_fts (key, value, source, tags) VALUES (?, ?, ?, ?)",
+                    (survivor_key, new_value, survivor["source"], fts_tags),
+                )
+
+                # 删除 merged 的主记录
+                conn.execute("DELETE FROM memory_vectors WHERE key = ?", (merged_key,))
+
+                # 重建 closure_table（因为因果链接结构变了）
+                self._rebuild_closure_table(conn)
+
+                conn.commit()
+
+                return {
+                    "survivor_key": survivor_key,
+                    "merged_key": merged_key,
+                    "strategy": strategy,
+                    "old_confidence": round(old_confidence, 4),
+                    "new_confidence": round(new_confidence, 4),
+                    "links_transferred": links_transferred,
+                    "causal_transferred": causal_transferred,
+                    "tags_merged": len(combined_tags),
+                }
+
+            except Exception:
+                conn.rollback()
+                raise
+
+        except Exception as e:
+            print(f"[vmem] merge_memories error: {e}")
+            return {"error": str(e)}
+
+    # ------------------------------------------------------------------
     # 上下文管理器
     # ------------------------------------------------------------------
 
     def close(self):
         if self._conn:
-            self._conn.close()
+            try:
+                self._conn.close()
+            except Exception:
+                pass
             self._conn = None
+        # 关闭连接池中所有连接
+        if hasattr(self, "_pool") and self._pool is not None:
+            self._pool.close_all()
 
     def __enter__(self):
         return self
@@ -1412,12 +2643,14 @@ def search_fusion(
     source_filter: Optional[str] = None,
     level_filter: Optional[str] = None,
     tags_filter: Optional[List[str]] = None,
+    project_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     融合搜索的便捷包装函数。
     自动用 encoder 编码 query，调用 store.search_fusion()，
-    再根据 source/level/tags 过滤。
+    再根据 source/level/tags/project 过滤。
     注意：level_filter 参数名保持不变（向后兼容），过滤 importance 字段。
+    project_filter: 空字符串或 None 表示不过滤；非空则只返回匹配项目的记忆。
     """
     query_emb = encoder.encode([query])[0]
     results = store.search_fusion(query=query, query_emb=query_emb, top_k=top_k * 3)
@@ -1429,6 +2662,11 @@ def search_fusion(
             continue
         if level_filter and r.get("importance", "") != level_filter:
             continue
+        if project_filter is not None and project_filter != "":
+            mem_project = r.get("project", "")
+            # 全局记忆（project 为空）对所有项目可见
+            if mem_project and mem_project != project_filter:
+                continue
         if tags_filter:
             entry_tags = r.get("tags", "")
             # Tags are now JSON arrays (D-07), with fallback for legacy comma-separated

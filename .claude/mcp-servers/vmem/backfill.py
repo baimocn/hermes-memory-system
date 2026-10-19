@@ -7,6 +7,8 @@ backfill.py - 将所有现有记忆迁移到 vmem 向量库
   3. 文件记忆 (.md 文件)
 
 直接调用 MemoryVectorStore.store()，不走 MCP。
+
+所有路径通过 vmem.config 自动检测，支持 HMS_* 环境变量或 config.json 覆盖。
 """
 
 import os
@@ -17,6 +19,7 @@ from pathlib import Path
 
 # 将 vmem 模块加入 path
 sys.path.insert(0, r"C:\Users\35955\.claude\mcp-servers")
+from vmem.config import DB_PATH, MODEL_PATH, MEMORY_DIR, CLAUDE_DIR
 from vmem.store import MemoryVectorStore, EmbeddingEngine
 
 
@@ -170,7 +173,7 @@ def migrate_evolution_db(store: MemoryVectorStore):
     """迁移 Evolution 记忆数据库"""
     print_header("2. 迁移 Evolution 记忆")
 
-    db_path = r"C:\Users\35955\.claude\memory\evolution_memory.db"
+    db_path = os.path.join(MEMORY_DIR, "evolution_memory.db")
     if not os.path.exists(db_path):
         print(f"  跳过: {db_path} 不存在")
         return
@@ -202,7 +205,7 @@ def migrate_file_memories(store: MemoryVectorStore):
     """迁移文件记忆 (.md 文件)"""
     print_header("3. 迁移文件记忆")
 
-    mem_dir = Path(r"C:\Users\35955\.claude\projects\C--Users-35955\memory")
+    mem_dir = Path(MEMORY_DIR) / "file-memories"
     if not mem_dir.exists():
         print(f"  跳过: {mem_dir} 不存在")
         return
@@ -242,13 +245,13 @@ def migrate_file_memories(store: MemoryVectorStore):
 def main():
     print_header("vmem 全量迁移脚本")
     print(f"  启动时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  模型路径: C:\\Users\\35955\\bge-small-zh-v1.5")
-    print(f"  数据库: C:\\Users\\35955\\.claude\\memory\\vmem.db")
+    print(f"  模型路径: {MODEL_PATH}")
+    print(f"  数据库: {DB_PATH}")
 
     start = time.time()
 
     # 初始化 store (会自动创建目录和表)
-    engine = EmbeddingEngine(model_path=r"C:\Users\35955\bge-small-zh-v1.5")
+    engine = EmbeddingEngine(model_path=MODEL_PATH)
     store = MemoryVectorStore(embedding_engine=engine)
 
     # 执行三类迁移

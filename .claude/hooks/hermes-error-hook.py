@@ -10,23 +10,26 @@ hermes-error-hook.py — 工具调用失败时自动分析错误模式并存储�
   2. 如果命中已知模式，生成因果链（问题→原因→解法）
   3. 存储到 vmem（优先带向量，超时则无向量留待 SessionEnd 补）
   4. 5 秒总超时，所有异常静默吞掉
+  5. 使用 HookWriter 进行多进程安全写入
 """
 
 import hashlib
 import json
 import os
-import sqlite3
 import sys
 import threading
 import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# 常量
+# 统一初始化
 # ---------------------------------------------------------------------------
 
-VMEM_DIR = Path(r"C:\Users\35955\.claude\mcp-servers")
-DB_PATH = r"C:\Users\35955\.claude\memory\vmem.db"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _helper import init_hook_env, get_hook_db_path
+
+init_hook_env()
+
 TIMEOUT_SEC = 4.5
 
 # ---------------------------------------------------------------------------
@@ -108,59 +111,10 @@ def _format_field(template: str, tool: str, file_path: str, command: str) -> str
     )
 
 
-def store_without_embedding(key: str, value: str, source: str, level: str, tags: str) -> bool:
-    """直接写 SQLite，跳过 embedding 编码。"""
-    try:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        conn = sqlite3.connect(DB_PATH, timeout=5)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=3000")
-
-        now = int(time.time())
-        row = conn.execute(
-            "SELECT created_at FROM memory_vectors WHERE key = ?", (key,)
-        ).fetchone()
-        created_at = row[0] if row else now
-
-        tags_json = json.dumps([t.strip() for t in tags.split(",") if t.strip()], ensure_ascii=False) if tags else "[]"
-
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO memory_vectors
-                (key, value, source, importance, tags, related, embedding, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, '[]', NULL, ?, ?)
-            """,
-            (key, value, source, level, tags_json, created_at, now),
-        )
-
-        conn.execute("DELETE FROM memory_fts WHERE key = ?", (key,))
-        conn.execute(
-            "INSERT INTO memory_fts (key, value, source, tags) VALUES (?, ?, ?, ?)",
-            (key, value, source, tags),
-        )
-
-        conn.commit()
-        conn.close()
-        return True
-    except Exception:
-        return False
-
-
-def store_with_embedding(key: str, value: str, source: str, level: str, tags: str) -> bool:
-    """用 MemoryVectorStore 存储（含向量编码）。"""
-    try:
-        sys.path.insert(0, str(VMEM_DIR))
-        from vmem.store import MemoryVectorStore
-
-        with MemoryVectorStore(DB_PATH) as store:
-            store.store(key=key, value=value, source=source, level=level, tags=tags)
-        return True
-    except Exception:
-        return store_without_embedding(key, value, source, level, tags)
-
-
 def store_causal_chain(tool: str, error: str, file_path: str, command: str, pattern: dict) -> bool:
-    """Create a causal chain: problem → cause → resolution."""
+    """Create a causal chain: problem → cause → resolution.
+    使用 HookWriter 进行多进程安全写入。
+    """
     try:
         lesson = _format_field(pattern["lesson"], tool, file_path, command)
         cause = _format_field(pattern["cause"], tool, file_path, command)
@@ -171,24 +125,47 @@ def store_causal_chain(tool: str, error: str, file_path: str, command: str, patt
         cause_key = f"err:cause:{hash_val}"
         resolution_key = f"err:resolution:{hash_val}"
 
-        # Store problem and cause entries
-        store_with_embedding(problem_key, lesson, "error", "short", f"error,{tool.lower()},problem")
-        store_with_embedding(cause_key, cause, "error", "short", f"error,{tool.lower()},cause")
+        from _hook_writer import HookWriter
 
-        # Create causal link: problem ← caused_by ← cause
-        sys.path.insert(0, str(VMEM_DIR))
-        from vmem.store import MemoryVectorStore
+        with HookWriter(get_hook_db_path(), timeout_sec=TIMEOUT_SEC) as writer:
+            # Store problem and cause entries
+            writer.store_memory(
+                key=problem_key, value=lesson, source="error",
+                level="short", tags=f"error,{tool.lower()},problem",
+            )
+            writer.store_memory(
+                key=cause_key, value=cause, source="error",
+                level="short", tags=f"error,{tool.lower()},cause",
+            )
 
-        with MemoryVectorStore(DB_PATH) as store:
-            store.causal_add(problem_key, cause_key, "caused_by")
+            # Create causal link: problem ← caused_by ← cause
+            writer.causal_add(problem_key, cause_key, "caused_by")
 
             # If resolution exists, add it
             if resolution:
-                store_with_embedding(resolution_key, resolution, "error", "short", f"error,{tool.lower()},resolution")
-                store.causal_add(cause_key, resolution_key, "resolved")
+                writer.store_memory(
+                    key=resolution_key, value=resolution, source="error",
+                    level="short", tags=f"error,{tool.lower()},resolution",
+                )
+                writer.causal_add(cause_key, resolution_key, "resolved")
 
         return True
 
+    except Exception:
+        return False
+
+
+def store_without_embedding(key: str, value: str, source: str, level: str, tags: str) -> bool:
+    """使用 HookWriter 直接写 SQLite（MemoryVectorStore 内部无 embedding 时的降级路径）。"""
+    try:
+        from _hook_writer import HookWriter
+
+        with HookWriter(get_hook_db_path(), timeout_sec=2.0) as writer:
+            writer.store_memory(
+                key=key, value=value, source=source,
+                level=level, tags=tags,
+            )
+        return True
     except Exception:
         return False
 

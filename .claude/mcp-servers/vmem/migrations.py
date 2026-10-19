@@ -335,6 +335,17 @@ def _migrate_013_create_confidence_log(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_014_add_project_column(conn: sqlite3.Connection) -> None:
+    """014 — Add project column to memory_vectors for per-project isolation."""
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(memory_vectors)").fetchall()}
+    if "project" not in columns:
+        conn.execute("ALTER TABLE memory_vectors ADD COLUMN project TEXT DEFAULT ''")
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_memory_vectors_project
+        ON memory_vectors(project)
+    """)
+
+
 # ---------------------------------------------------------------------------
 # MIGRATIONS registry
 # ---------------------------------------------------------------------------
@@ -353,6 +364,7 @@ MIGRATIONS = [
     ("011_profile_unique_index", _migrate_011_add_profile_unique_index),
     ("012_add_confidence_column", _migrate_012_add_confidence_column),
     ("013_create_confidence_log", _migrate_013_create_confidence_log),
+    ("014_add_project_column", _migrate_014_add_project_column),
 ]
 
 

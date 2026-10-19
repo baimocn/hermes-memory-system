@@ -11,6 +11,16 @@ import sys
 import json
 import signal
 import time
+import os
+
+# ---------------------------------------------------------------------------
+# 统一初始化
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _helper import init_hook_env, get_hook_db_path
+
+init_hook_env()
 
 
 class _Timeout(Exception):
@@ -25,14 +35,14 @@ if hasattr(signal, "SIGALRM"):
     signal.signal(signal.SIGALRM, _alarm_handler)
 
 
-def _build_session_output(db_path: str) -> dict:
+def _build_session_output(cwd: str = "") -> dict:
     """Query profile, recent memories, and lessons."""
-    sys.path.insert(0, "C:/Users/35955/.claude/mcp-servers")
-    from vmem.store import MemoryVectorStore
+    from _helper import get_store, derive_project
 
-    store = MemoryVectorStore(db_path)
+    store = get_store()
     conn = store._get_conn()
     now = int(time.time())
+    project = derive_project(cwd)
 
     sections = []
 
@@ -42,14 +52,25 @@ def _build_session_output(db_path: str) -> dict:
 
     # --- 2. 近期记忆（最近 7 天，按置信度降序，取 top 10）---
     week_ago = now - 7 * 86400
-    recent = conn.execute(
-        """SELECT key, value, source, confidence
-           FROM memory_vectors
-           WHERE updated_at > ? AND importance != 'archived'
-           ORDER BY confidence DESC
-           LIMIT 10""",
-        (week_ago,),
-    ).fetchall()
+    if project:
+        recent = conn.execute(
+            """SELECT key, value, source, confidence
+               FROM memory_vectors
+               WHERE updated_at > ? AND importance != 'archived'
+                 AND (project = ? OR project = '')
+               ORDER BY confidence DESC
+               LIMIT 10""",
+            (week_ago, project),
+        ).fetchall()
+    else:
+        recent = conn.execute(
+            """SELECT key, value, source, confidence
+               FROM memory_vectors
+               WHERE updated_at > ? AND importance != 'archived'
+               ORDER BY confidence DESC
+               LIMIT 10""",
+            (week_ago,),
+        ).fetchall()
 
     if recent:
         lines = ["## Recent Memories (7 days)"]
@@ -60,14 +81,26 @@ def _build_session_output(db_path: str) -> dict:
         sections.append("\n".join(lines))
 
     # --- 3. 高置信度教训（confidence >= 0.7）---
-    lessons = conn.execute(
-        """SELECT key, value, confidence
-           FROM memory_vectors
-           WHERE (source LIKE '%lesson%' OR tags LIKE '%lesson%')
-             AND confidence >= 0.7
-           ORDER BY confidence DESC
-           LIMIT 5"""
-    ).fetchall()
+    if project:
+        lessons = conn.execute(
+            """SELECT key, value, confidence
+               FROM memory_vectors
+               WHERE (source LIKE '%lesson%' OR tags LIKE '%lesson%')
+                 AND confidence >= 0.7
+                 AND (project = ? OR project = '')
+               ORDER BY confidence DESC
+               LIMIT 5""",
+            (project,),
+        ).fetchall()
+    else:
+        lessons = conn.execute(
+            """SELECT key, value, confidence
+               FROM memory_vectors
+               WHERE (source LIKE '%lesson%' OR tags LIKE '%lesson%')
+                 AND confidence >= 0.7
+               ORDER BY confidence DESC
+               LIMIT 5"""
+        ).fetchall()
 
     if lessons:
         lines = ["## Important Lessons"]
@@ -106,7 +139,9 @@ def main():
         signal.alarm(5)
     try:
         raw = sys.stdin.read()
-        output = _build_session_output("C:/Users/35955/.claude/memory/vmem.db")
+        data = json.loads(raw) if raw.strip() else {}
+        cwd = data.get("cwd", "")
+        output = _build_session_output(cwd=cwd)
         print(json.dumps(output, ensure_ascii=False))
     except (_Timeout, Exception):
         pass

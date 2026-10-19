@@ -7,12 +7,24 @@ profile attributes in the profile_attributes table.
 Reads JSON from stdin: {"prompt": "...", "session_id": "..."}
 Outputs nothing to stdout on success.
 5-second hard timeout.
+Uses HookWriter for multi-process safe writes.
 """
 
 import sys
 import json
 import re
 import signal
+import os
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 统一初始化
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _helper import init_hook_env, get_hook_db_path
+
+init_hook_env()
 
 # ---------------------------------------------------------------------------
 # Timeout guard
@@ -24,7 +36,7 @@ class _Timeout(Exception):
 def _alarm_handler(signum, frame):
     raise _Timeout()
 
-# Install alarm where supported
+# Install alarm where available
 if hasattr(signal, "SIGALRM"):
     signal.signal(signal.SIGALRM, _alarm_handler)
 
@@ -121,34 +133,39 @@ def main():
         if not prompt or len(prompt) > 2000:
             return
 
-        sys.path.insert(0, "C:/Users/35955/.claude/mcp-servers")
-        from vmem.store import MemoryVectorStore
+        from _hook_writer import HookWriter
 
-        store = MemoryVectorStore("C:/Users/35955/.claude/memory/vmem.db")
+        db_path = get_hook_db_path()
 
         seen = set()
+        extracted = []
         for pref_type, pref_text in extract_preferences(prompt):
             key_text = f"{pref_type}:{pref_text}"
             if key_text in seen:
                 continue
             seen.add(key_text)
+            extracted.append((pref_type, pref_text))
 
-            cat, attr_key = _CATEGORY_MAP[pref_type]
-            conf = _CATEGORY_CONFIDENCE[pref_type]
+        if not extracted:
+            return
 
-            # Check if attribute already exists; merge values if different
-            existing = store.profile_get(attr_key=attr_key)
-            if existing:
-                old_val = existing[0]["attr_value"]
-                if pref_text in old_val:
-                    continue  # duplicate
-                new_val = f"{old_val}; {pref_text}"
-            else:
-                new_val = pref_text
+        # Use HookWriter for multi-process safe writes
+        with HookWriter(db_path, timeout_sec=3.0) as writer:
+            for pref_type, pref_text in extracted:
+                cat, attr_key = _CATEGORY_MAP[pref_type]
+                conf = _CATEGORY_CONFIDENCE[pref_type]
 
-            store.profile_set(attr_key, new_val, cat, conf, "auto-preference")
+                # Check if attribute already exists; merge values if different
+                existing = writer.profile_get(attr_key=attr_key)
+                if existing:
+                    old_val = existing[0]["attr_value"]
+                    if pref_text in old_val:
+                        continue  # duplicate
+                    new_val = f"{old_val}; {pref_text}"
+                else:
+                    new_val = pref_text
 
-        store.close()
+                writer.profile_set(attr_key, new_val, cat, conf, "auto-preference")
 
     except (_Timeout, Exception):
         # Silently swallow all errors — hook must never break the host
